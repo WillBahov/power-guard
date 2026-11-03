@@ -57,6 +57,7 @@ PROTECTED = {
 # actual battery drift.
 W_PER_CORE = 7.5
 IDLE_W = 15.0
+CHARGER_W = 75.0        # measured continuous delivery of the adapter
 
 
 def log(msg: str) -> None:
@@ -65,6 +66,13 @@ def log(msg: str) -> None:
         print(msg, flush=True)
     except BrokenPipeError:
         sys.exit(0)
+
+
+def watts_to_cores(watts: float, idle_watts: float = IDLE_W,
+                   w_per_core: float = W_PER_CORE) -> float:
+    """Core budget whose estimated draw is exactly `watts`.
+    75 W cap, 15 W base, 7.5 W per core -> 8 cores."""
+    return max(0.0, (watts - idle_watts) / w_per_core)
 
 
 def pid_alive(pid: int) -> bool:
@@ -76,6 +84,37 @@ def pid_alive(pid: int) -> bool:
 
 
 # --------------------------------------------------------------- power state
+POWER_CMD = ["sudo", "-n", "powermetrics", "--samplers", "power", "-i", "1000", "-n", "1"]
+
+
+def parse_power(text: str) -> dict:
+    """Instantaneous watts from powermetrics output, e.g. 'Battery Power: -12.4 W'.
+
+    Returns {name: watts}; a negative battery power means the machine is drawing
+    more than the adapter can supply. Pure function, so it is testable.
+    """
+    out = {}
+    for line in text.splitlines():
+        m = re.search(r"([A-Za-z][A-Za-z ]*Power)\s*:\s*(-?\d+(?:\.\d+)?)\s*W", line)
+        if m:
+            out[m.group(1).strip().lower()] = float(m.group(2))
+    return out
+
+
+def live_power() -> dict | None:
+    """Real wattage if powermetrics is reachable (needs sudo), else None."""
+    try:
+        r = subprocess.run(POWER_CMD, capture_output=True, text=True, timeout=8)
+    except Exception:
+        return None
+    watts = parse_power(r.stdout)
+    if not watts:
+        return None
+    if "battery power" in watts:
+        watts["overdraw_w"] = max(0.0, -watts["battery power"])
+    return watts
+
+
 def power_state() -> dict:
     """{source, soc, charging} from pmset. No root needed."""
     out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True).stdout
@@ -217,11 +256,12 @@ def compute_duty(demands: dict[int, float], budget_cores: float,
 # --------------------------------------------------------------- the guard
 class Guard:
     def __init__(self, budget_cores: float, tick: float = 1.0,
-                 charger_watts: float = 100.0, w_per_core: float = W_PER_CORE,
+                 charger_watts: float = CHARGER_W, w_per_core: float = W_PER_CORE,
                  idle_watts: float = IDLE_W, auto: bool = False,
                  floor_cores: float = 0.2, battery_wh: float = 71.0,
                  fb_window: float = 180.0, scope: set | None = None,
-                 root_pid: int | None = None, exclude: set | None = None):
+                 root_pid: int | None = None, exclude: set | None = None,
+                 live_power_feed: bool = False):
         self.budget_cores = budget_cores
         self.max_cores = n_cores()
         self.tick = tick
@@ -239,10 +279,24 @@ class Guard:
         self.stopped: set[int] = set()
         self.paused = False
         self.history: list[tuple[float, int, float]] = []
+        self.power_feed = live_power_feed
+        self.last_watts: float | None = None
 
     def est_watts(self, cores: float) -> float:
         """Ballpark system draw; the --auto loop uses real battery drift."""
         return self.idle_watts + self.w_per_core * cores
+
+    def budget_from_watts(self, watts: float) -> float:
+        """Core budget whose estimated draw is exactly `watts`."""
+        return watts_to_cores(watts, self.idle_watts, self.w_per_core)
+
+    def budget_watts(self) -> float:
+        """The watt ceiling the current core budget corresponds to."""
+        return self.est_watts(self.budget_cores)
+
+    def over_cap(self, cores: float) -> float:
+        """How far the estimated draw exceeds the cap (positive = draining)."""
+        return self.est_watts(cores) - self.charger_watts
 
     def _save(self) -> None:
         try:
@@ -340,10 +394,24 @@ class Guard:
                 demands = sampler.sample()
                 cores = sum(demands.values())
                 note = self.steer(t0, st["soc"], cores)
+                if self.power_feed:
+                    watts = live_power()
+                    if watts:
+                        self.last_watts = watts.get("battery power")
+                        over = self.over_cap(-self.last_watts) if self.last_watts is not None else 0.0
+                        # the adapter is genuinely short: shave the budget now
+                        if over > 0:
+                            self.budget_cores = max(2.0, self.budget_cores - over / self.w_per_core)
+                            note = f"measured {self.last_watts:.1f} W from battery -> budget {self.budget_cores:.1f} cores"
+                        else:
+                            note = "measured battery power %.1f W, no overdraw" % (self.last_watts or 0.0)
                 if self.paused:
                     self.duty = {}
                 else:
-                    self.duty = compute_duty(demands, self.budget_cores, self.duty, self.floor)
+                    # the cap can be lowered mid-run with --charger-watts, so
+                    # re-derive it every tick and never exceed it
+                    cap_cores = min(self.budget_cores, self.budget_from_watts(self.charger_watts))
+                    self.duty = compute_duty(demands, cap_cores, self.duty, self.floor)
                 throttle = {p: f for p, f in self.duty.items() if f < 0.999}
 
                 snap = {
@@ -351,6 +419,9 @@ class Guard:
                     "soc": st["soc"], "source": st["source"], "charging": st["charging"],
                     "cores": cores, "watts": self.est_watts(cores),
                     "budget": self.budget_cores, "throttled": len(throttle), "note": note,
+                    "cap": self.charger_watts, "over": self.over_cap(cores),
+                    "measured_watts": self.last_watts,
+                    "budget_watts": self.budget_watts(),
                     "top": [(pid, sampler.last.get(pid, "?"), d, self.duty.get(pid, 1.0))
                             for pid, d in sorted(demands.items(), key=lambda kv: -kv[1])[:6]],
                 }
@@ -388,16 +459,16 @@ def cmd_status(a: argparse.Namespace) -> None:
     demands = sampler.sample()
     cores = sum(demands.values())
     top = sorted(demands.items(), key=lambda kv: -kv[1])[:8]
-    est = IDLE_W + a.w_per_core * cores
+    est = a.idle_watts + a.w_per_core * cores
     over = est - a.charger_watts
     print(f"power source : {st['source']}, soc {st['soc']}%, charging={st['charging']}")
-    print(f"cores        : {n_cores()} (base {IDLE_W:.0f} W, {a.w_per_core} W per loaded core)")
+    print(f"cores        : {n_cores()} (base {a.idle_watts:.0f} W, {a.w_per_core} W per loaded core)")
     print(f"CPU in use   : {cores:.2f} cores -> est system draw ~{est:.0f} W")
     if st["source"] == "AC":
         if over > 0:
+            target = max(2.0, (a.charger_watts - a.idle_watts) / a.w_per_core)
             print(f"charger cap  : {a.charger_watts} W, OVER by {over:.0f} W - the battery "
-                  f"is feeding the gap. Cap CPU to "
-                  f"{max(2.0, cores - over / a.w_per_core):.1f} cores.")
+                  f"is feeding the gap. Cap CPU to {target:.1f} cores.")
         else:
             print(f"charger cap  : {a.charger_watts} W, {abs(over):.0f} W headroom")
     else:
@@ -416,13 +487,26 @@ def _saved_budget() -> float | None:
 
 
 def cmd_guard(a: argparse.Namespace) -> None:
-    budget = a.budget_cores
-    if budget is None:
-        budget = _saved_budget() if a.auto else 8.0
+    cap = a.budget_watts if a.budget_watts is not None else a.charger_watts
+    learned = _saved_budget() if a.auto else None
+    if a.budget_cores is not None:
+        budget, why = a.budget_cores, "pinned"
+    elif learned is not None:
+        budget, why = learned, "learned"
+    else:
+        budget, why = watts_to_cores(cap, a.idle_watts, a.w_per_core), "from cap"
+    max_cores = n_cores()
+    cap_cores = watts_to_cores(cap, a.idle_watts, a.w_per_core)
+    print(f"power_guard: act at {cap:.0f} W -> budget {min(budget, max_cores):.1f} cores "
+          f"({why})", flush=True)
+    if budget > cap_cores:
+        print(f"note: {budget:.1f} cores is ~{a.idle_watts + a.w_per_core * budget:.0f} W, above "
+              f"the {cap:.0f} W cap. The throttle will hold at {cap_cores:.1f} cores; raise "
+              f"--budget-watts or --charger-watts to allow more.", flush=True)
     Guard(budget_cores=budget, tick=a.tick, charger_watts=a.charger_watts,
           w_per_core=a.w_per_core, auto=a.auto, floor_cores=a.floor,
           battery_wh=a.battery_wh, fb_window=a.fb_window,
-          exclude=set(a.exclude)).run(
+          exclude=set(a.exclude), live_power_feed=a.power).run(
         duration=a.duration, quiet=a.quiet,
         ui=(not a.no_ui and (a.ui or sys.stdout.isatty())))
 
@@ -433,7 +517,7 @@ def cmd_wrap(a: argparse.Namespace) -> None:
     print(f"wrap: pid {child.pid} capped to {a.cores} cores "
           f"(charger {a.charger_watts} W) - Ctrl-C to stop", flush=True)
     g = Guard(budget_cores=a.cores, tick=a.tick, charger_watts=a.charger_watts,
-              w_per_core=a.w_per_core, root_pid=child.pid)
+              w_per_core=a.w_per_core, idle_watts=a.idle_watts, root_pid=child.pid)
     try:
         g.run(stop_when=lambda: child.poll() is not None)
     except KeyboardInterrupt:
@@ -441,10 +525,27 @@ def cmd_wrap(a: argparse.Namespace) -> None:
     print(f"wrap: child exited with code {child.wait()}")
 
 
+def cmd_power(a: argparse.Namespace) -> None:
+    """Report which power telemetry this machine will actually give us."""
+    st = power_state()
+    print(f"power source : {st['source']}, soc {st['soc']}%, charging={st['charging']}")
+    print(f"estimated CPU draw (idle {a.idle_watts:.0f} W + {a.w_per_core} W/core) "
+          f"against a {a.charger_watts:.0f} W ceiling")
+    watts = live_power()
+    if watts:
+        print("powermetrics  : available -", ", ".join(f"{k} {v:.1f} W" for k, v in watts.items()))
+        print("the guard can close the loop on real watts with --power")
+    else:
+        print("powermetrics  : not readable without a password, so the guard uses "
+              "the CPU estimate plus the battery drift (which is a real measurement "
+              "of overdraw, just slower)")
+
+
 def cmd_calibrate(a: argparse.Namespace) -> None:
     """Measure the load level at which the battery stops draining."""
     n = n_cores()
-    g = Guard(budget_cores=n, charger_watts=a.charger_watts, w_per_core=a.w_per_core)
+    g = Guard(budget_cores=n, charger_watts=a.charger_watts, w_per_core=a.w_per_core,
+              idle_watts=a.idle_watts)
     src = "n = 0\nwhile True:\n    for i in range(300000):\n        n += i * i\n"
 
     def measure(minutes: float, label: str, load: int) -> float:
@@ -483,21 +584,27 @@ def cmd_calibrate(a: argparse.Namespace) -> None:
 
 def main() -> None:
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--charger-watts", type=float, default=100.0)
+    common.add_argument("--charger-watts", type=float, default=CHARGER_W,
+                    help="continuous W the adapter actually delivers (default 75)")
     common.add_argument("--w-per-core", type=float, default=W_PER_CORE)
+    common.add_argument("--idle-watts", type=float, default=IDLE_W,
+                        help="base draw of an idle machine (default 15 W)")
 
     p = argparse.ArgumentParser(description="Keep a plugged-in MacBook off the battery "
                                 "by capping aggregate CPU load.")
     sub = p.add_subparsers(dest="cmd")
 
     sp = sub.add_parser("status", parents=[common], help="power state + who is eating the CPU")
-    sp.add_argument("--budget-cores", type=float, default=8.0)
+    sp.add_argument("--budget-cores", type=float, default=None)
     sp.set_defaults(fn=cmd_status)
 
     sg = sub.add_parser("guard", parents=[common], help="run the throttle loop")
     sg.add_argument("--budget-cores", type=float, default=None,
-                    help="starting core budget (default: 8, or the learned value "
-                         "in ~/.config/power_guard.json when --auto is used)")
+                    help="pin the budget in cores (otherwise it is derived from "
+                         "--budget-watts, or the learned value when --auto)")
+    sg.add_argument("--budget-watts", type=float, default=None,
+                    help="act when the estimated draw reaches this many watts "
+                         "(defaults to --charger-watts)")
     sg.add_argument("--auto", action="store_true",
                     help="steer the budget off measured battery drain")
     sg.add_argument("--tick", type=float, default=1.0)
@@ -512,6 +619,8 @@ def main() -> None:
     sg.add_argument("--quiet", action="store_true", help="no per-tick output")
     sg.add_argument("--ui", action="store_true", help="live dashboard (default in a terminal)")
     sg.add_argument("--no-ui", action="store_true", help="plain one-line-per-tick log")
+    sg.add_argument("--power", action="store_true",
+                    help="close the loop on real watts from powermetrics (needs sudo)")
     sg.set_defaults(fn=cmd_guard)
 
     sw = sub.add_parser("wrap", parents=[common], help="run one command capped to N cores")
@@ -519,6 +628,9 @@ def main() -> None:
     sw.add_argument("--tick", type=float, default=1.0)
     sw.add_argument("command", nargs="+")
     sw.set_defaults(fn=cmd_wrap)
+
+    spw = sub.add_parser("power", parents=[common], help="show what power telemetry is available")
+    spw.set_defaults(fn=cmd_power)
 
     sc = sub.add_parser("calibrate", parents=[common], help="measure the load knee empirically")
     sc.add_argument("--minutes", type=float, default=3.0)

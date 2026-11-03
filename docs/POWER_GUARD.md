@@ -2,8 +2,10 @@
 
 ## Why this happens
 
-The adapter is rated 100 W. When the machine wants more than that, macOS does
-not clamp the load - the battery quietly supplies the difference. There is no
+The adapter is rated 100 W but sustains about 75 W in practice. When the machine
+wants more than that, macOS does not clamp the load - the battery quietly
+supplies the difference. That is why the guard defaults to `--charger-watts 75`
+and derives its core budget from the cap: `(75 - 15) / 7.5 = 8 cores`. There is no
 `pmset` setting, no System Settings toggle and no API that says "run off the
 adapter only". The only lever a program has is the load itself.
 
@@ -16,12 +18,13 @@ Measured on this machine (M4 Pro, 14 cores, 71 Wh battery, 2026-11-03):
 | 14 busy loops + normal background apps | ~15 cores | 78% -> 77% in 8 min |
 
 1% of 71 Wh over 8 minutes is **8.5 W**. So the CPU alone at full load sits
-just under 100 W; it is the CPU *plus* display, GPU/ANE and the usual
+just under the adapter's nominal 100 W, but above the ~75 W it can
+hold continuously; it is the CPU *plus* display, GPU/ANE and the usual
 background daemons that cross the line. That has two consequences:
 
 * capping aggregate CPU is the only lever software has, and it is effective -
   the overdraw shows up as a SOC decline that the guard can drive to zero;
-* the watts-per-core constant (`W_PER_CORE = 7.5`, `IDLE_W = 15`) is a
+* the watts-per-core constant (`W_PER_CORE = 7.5`, `IDLE_W = 15`, `CHARGER_W = 75`) is a
   calibration, not a measurement of the GPU. `--auto` does not care: it steers
   on the actual battery trend whatever is causing the draw.
 
@@ -63,7 +66,7 @@ SIGCONTs every process it stopped on exit or Ctrl-C. Stdlib only: `ps`, `pmset`,
 python3 power_guard.py status
 
 # hard cap the machine at 8 cores
-python3 power_guard.py guard --budget-cores 8   # --ui is on in a terminal
+python3 power_guard.py guard --auto              # budget derived from the 75 W cap
 
 # self-calibrating, running in the background
 nohup python3 power_guard.py guard --auto --budget-cores 12 \

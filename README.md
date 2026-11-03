@@ -1,14 +1,19 @@
 # Power Guard — stop the battery draining while plugged in
 
 `power_guard.py` keeps a plugged-in MacBook Pro off its battery by capping
-**aggregate CPU load**. The 100 W adapter cannot cover a fully loaded M4 Pro
-plus the GPU and display, so macOS quietly borrows the difference from the
-battery. There is no `pmset` setting, no System Settings toggle and no API for
+**aggregate CPU load**. The adapter is rated 100 W but only sustains about
+**75 W** under real load, and a fully loaded M4 Pro plus the GPU and display
+wants more, so macOS quietly borrows the difference from the battery. There is no `pmset` setting, no System Settings toggle and no API for
 "run on the adapter only" — the only lever software has is the load itself.
 
 The tool measures per-process CPU demand from `ps` CPU-time deltas (in
 core-equivalents, the unit power actually scales in) and duty-cycles the busy
-processes with `SIGSTOP`/`SIGCONT` so total CPU converges on a core budget.
+processes with `SIGSTOP`/`SIGCONT` so total CPU converges on a budget.
+
+The guard acts at **75 W by default**. With a 15 W base draw and 7.5 W per loaded
+core that ceiling is 8 cores: `(75 - 15) / 7.5`. The core budget is derived from
+the watt cap, so `--charger-watts` / `--budget-watts` decide when the throttle
+engages.
 
 * **Stdlib only** — `ps`, `pmset`, `sysctl`, `os.kill`. No pip install, no root.
 * **Python 3.9+**, macOS only (the battery read uses `pmset`).
@@ -39,8 +44,16 @@ cd /Users/will/Documents/Projects/power-guard
 # 1. see what is drawing power right now
 ./power_guard.py status
 
-# 2. cap the machine at 8 cores, self-correcting off the battery
-./power_guard.py guard --budget-cores 8 --auto
+# 2. run the guard - the budget is derived from the 75 W cap and steered
+#    off the actual battery trend
+./power_guard.py guard --auto
+```
+
+A different ceiling is a one-flag change:
+
+```bash
+./power_guard.py guard --auto --budget-watts 60   # act at 60 W -> 6 core budget
+./power_guard.py guard --budget-cores 10         # pin cores instead of watts
 ```
 
 Ctrl-C (or `q` in the dashboard) releases every stopped process. That is the
@@ -51,12 +64,13 @@ limits.
 
 ## The dashboard
 
-`guard` runs a live dashboard whenever stdout is a terminal (use `--no-ui` for
+`guard` runs a live dashboard whenever stdout is a terminal (the status line
+turns red when the estimate crosses the ceiling) (use `--no-ui` for
 the plain one-line-per-tick log, which is what the LaunchAgent uses). It shows:
 
 ```
  POWER GUARD  ·  14 cores  ·  15:20:46  ·  AC
- charger 100 W   budget 6.0 cores   mode auto   tick 1.0s   headroom +75 W
+ adapter 75 W   ceiling 60 W   budget 6.0 cores   mode auto   tick 1.0s   under the 60 W ceiling, 12 W headroom
  load  ████░░░░░░░░░░░░░░░░│░░░░░░░░░░░░░░░░░░░░░░░░
        1.29 cores busy  est ~25 W   soc 77%  False
  trend  ▄▅▁▇▂▃▂   last 6 ticks
@@ -176,14 +190,16 @@ headroom instead.
 | Flag | Applies to | Default | Meaning |
 |---|---|---|---|
 | `--ui` / `--no-ui` | `guard` | dashboard on in a terminal, off otherwise | Live dashboard vs plain log |
-| `--budget-cores N` | `guard`, `status` | `8`, or the saved value with `--auto` | Target total CPU in core-equivalents |
+| `--charger-watts W` | all | `75` | The watt ceiling the guard acts at |
+| `--budget-watts W` | `guard` | same as `--charger-watts` | Engage when the estimated draw hits W |
+| `--budget-cores N` | `guard`, `status` | derived from the watt cap | Pin the budget in cores |
+| `--idle-watts W` | all | `15` | Base draw of an otherwise idle machine |
+| `--w-per-core W` | all | `7.5` | Watts per busy core (calibration constant) |
 | `--auto` | `guard` | off | Steer the budget off measured battery drain |
 | `--fb-window S` | `guard` | `180` | Seconds of SOC history before a correction is made |
 | `--tick S` | `guard`, `wrap` | `1.0` | Sampling/stop-continue period in seconds |
 | `--floor N` | `guard` | `0.2` | Processes below this demand are never stopped |
 | `--exclude NAME` | `guard` | — | Never stop this process (repeatable) |
-| `--charger-watts W` | all | `100` | Adapter rating used in the estimate |
-| `--w-per-core W` | all | `7.5` | Watts per busy core (calibration constant) |
 | `--battery-wh Wh` | `guard`, `calibrate` | `71` | Battery capacity, for converting SOC drift to watts |
 | `--duration S` | `guard` | run forever | Exit after N seconds |
 | `--quiet` | `guard` | off | Suppress the per-tick line |
@@ -197,16 +213,52 @@ does not depend on the constant being right.
 
 ## How to pick a budget
 
-Start with 8 on a 14-core M4 Pro. That leaves ~25 W of headroom for the GPU,
-display and background daemons. Then:
+The default budget is whatever the cap implies: 75 W minus a 15 W base draw, over
+7.5 W per core = 8 cores on a 14-core M4 Pro. If the GPU or display is what is
+really draining the battery, drop the ceiling (`--budget-watts 60`) or let
+`--auto` find it. Then:
 
 1. Run your real heavy workload.
-2. `python3 power_guard.py calibrate --minutes 5` while that workload runs.
+2. `./power_guard.py calibrate --minutes 5` while that workload runs.
 3. Use the printed knee, or just let `--auto` find it — it will trim the budget
    until SOC stops falling.
 
 With 1% SOC resolution on a 71 Wh cell, one 3-minute window resolves about 14 W,
 i.e. under 2 cores. Expect `--auto` to converge over a few windows (5–10 min).
+
+---
+
+## Why the guard estimates watts instead of reading them
+
+macOS does not expose adapter or wall power to ordinary programs. Checked on
+this machine:
+
+* `powermetrics --samplers power` — the only tool that reports instantaneous
+  watts, and it is root-only (`sudo: a password is required`).
+* `ioreg` — no battery, adapter or SMC power keys are visible without root.
+* `pmset -g batt` and `system_profiler SPPowerDataType` — source and integer
+  state of charge only, no current or voltage.
+
+So the guard uses two signals:
+
+1. **An estimate** — `15 W idle + 7.5 W per busy core`, checked against the
+   `--charger-watts` ceiling (75 W default). Fast, per tick.
+2. **A real measurement** — battery drift. If SOC falls while on AC, the
+   machine is genuinely drawing more than the adapter supplies, and `--auto`
+   lowers the budget until the fall stops. Slow (1% resolution) but it does not
+   care *why* the draw is high — GPU, display or CPU.
+
+If you are willing to give the tool sudo, it can close the loop on actual
+watts:
+
+```bash
+./power_guard.py power                     # what telemetry this machine will give
+./power_guard.py guard --auto --power      # throttle on real measured watts each tick
+```
+
+`--power` runs `sudo -n powermetrics`, which only works if sudo is passwordless
+for that command (or if you start the guard with `sudo`). Without it the guard
+silently falls back to the estimate plus battery drift.
 
 ---
 
@@ -267,6 +319,6 @@ load, so it verifies the controller converges rather than ringing.
   5.3–6.9 cores and held there for 20 ticks.
 * `wrap --cores 3` on an 8-process multiprocessing job: held at 2.99–3.40 cores,
   exited cleanly when the job finished.
-* `calibrate --minutes 5` at full CPU load: 0 W drain — the 100 W adapter covered
+* `calibrate --minutes 5` at full CPU load: 0 W drain — even a 100 W adapter covered
   it, which is why the guard's `--auto` loop, not the static constant, is the
   part you should trust.

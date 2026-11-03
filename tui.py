@@ -52,13 +52,18 @@ def fmt_rows(top) -> list[str]:
 
 def head(guard, snap) -> list[str]:
     """The top block of the dashboard: what is configured and what is happening."""
-    headroom = guard.charger_watts - snap["watts"]
-    gap = ("headroom +%.0f W" % headroom) if headroom >= 0 else ("OVER by %.0f W" % -headroom)
+    adapter = snap.get("cap", guard.charger_watts)
+    ceiling = min(adapter, snap.get("budget_watts", guard.budget_watts()))
+    over = snap["watts"] - ceiling
+    if over > 0:
+        gap = "OVER the %d W ceiling by %.0f W - throttling" % (ceiling, over)
+    else:
+        gap = "under the %d W ceiling, %.0f W headroom" % (ceiling, -over)
     state = "PAUSED" if guard.paused else ("auto" if guard.auto else "fixed")
     return [
         " POWER GUARD  ·  %d cores  ·  %s  ·  %s" % (guard.max_cores, snap["clock"], snap["source"]),
-        " charger %.0f W   budget %.1f cores   mode %s   tick %.1fs   %s"
-        % (guard.charger_watts, snap["budget"], state, guard.tick, gap),
+        " adapter %d W   ceiling %d W   budget %.1f cores   mode %s   tick %.1fs   %s"
+        % (adapter, ceiling, snap["budget"], state, guard.tick, gap),
         " load  %s" % gauge(snap["cores"], snap["budget"], guard.max_cores),
         "       %.2f cores busy  est ~%.0f W   soc %s%%  %s"
         % (snap["cores"], snap["watts"], snap["soc"], snap["charging"]),
@@ -73,6 +78,7 @@ class Dashboard:
         self.trace: list[float] = []
         self.quit = False
         self.scr = None
+        self.red = self.green = 0
 
     def start(self) -> None:
         self.scr = curses.initscr()
@@ -84,6 +90,13 @@ class Dashboard:
         except Exception:
             pass
         self.scr.timeout(150)            # getch returns -1 quickly: never blocks the tick
+        try:
+            if curses.has_colors():
+                curses.init_pair(1, curses.COLOR_RED, curses.COLOR_DEFAULT)
+                curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_DEFAULT)
+                self.red, self.green = curses.color_pair(1), curses.color_pair(2)
+        except Exception:
+            pass
         self._put(0, 0, "power_guard dashboard starting...")
         self.scr.refresh()
 
@@ -101,9 +114,9 @@ class Dashboard:
         except Exception:
             pass
 
-    def _put(self, row: int, col: int, text: str) -> None:
+    def _put(self, row: int, col: int, text: str, attr: int = 0) -> None:
         try:
-            self.scr.addstr(row, col, text)
+            self.scr.addstr(row, col, text, attr)
         except UnicodeEncodeError:
             self._put(row, col, text.replace(BLOCK, "#").replace(EMPTY, ".").replace(MARK, "|")
                           .replace(SPARK[0], ",").replace(SPARK[-1], "#"))
@@ -117,7 +130,7 @@ class Dashboard:
         self.scr.erase()
         row = 0
         for line in head(self.g, snap):
-            self._put(row, 0, line)
+            self._put(row, 0, line, self.red if "OVER the" in line else self.green)
             row += 1
         self._put(row, 0, " trend  %s   last %d ticks" % (spark(self.trace), len(self.trace)))
         row += 1

@@ -44,15 +44,16 @@ def test_rows_sort_and_truncate_names():
 
 
 def test_head_reports_headroom_and_overdraw():
-    g = Guard(budget_cores=8.0, charger_watts=100.0)
+    g = Guard(budget_cores=8.0, charger_watts=75.0)
     ok = head(g, {"clock": "12:00:00", "source": "AC", "cores": 4.0,
-                  "watts": 45.0, "budget": 8.0, "tick": 1.0,
-                  "soc": 78, "charging": False})
+                  "watts": 45.0, "budget": 8.0, "budget_watts": 75.0, "cap": 75.0,
+                  "over": -30.0, "tick": 1.0, "soc": 78, "charging": False})
     drain = head(g, {"clock": "12:00:00", "source": "AC", "cores": 13.0,
-                     "watts": 112.0, "budget": 8.0, "tick": 1.0,
-                     "soc": 78, "charging": False})
-    assert "headroom +55 W" in ok[1]
-    assert "OVER by 12 W" in drain[1]
+                     "watts": 112.0, "budget": 8.0, "budget_watts": 75.0, "cap": 75.0,
+                     "over": 37.0, "tick": 1.0, "soc": 78, "charging": False})
+    assert "ceiling 75 W" in ok[1]
+    assert "30 W headroom" in ok[1]
+    assert "OVER the 75 W ceiling by 37 W - throttling" in drain[1]
     assert "PAUSED" not in ok[1]
 
 

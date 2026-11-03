@@ -6,7 +6,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from power_guard import Guard, compute_duty, power_state  # noqa: E402
+from power_guard import (Guard, compute_duty, parse_power, power_state,
+                      watts_to_cores)  # noqa: E402
 
 
 def measured(duty, demands):
@@ -80,3 +81,44 @@ def test_auto_steering_corrects_once_per_window():
     assert len(corrections) == 1, f"expected one correction, got {len(corrections)}"
     # 1% of 71 Wh over 180 s = 14.2 W = ~1.9 cores, not the whole 14-core budget
     assert 11.0 < g.budget_cores < 13.5, g.budget_cores
+
+def test_watts_to_cores_conversion():
+    # 75 W cap, 15 W base, 7.5 W/core -> 8 cores, which is the default budget
+    assert watts_to_cores(75.0) == 8.0
+    assert abs(watts_to_cores(100.0) - 11.333) < 1e-3
+    assert watts_to_cores(15.0) == 0.0
+    assert watts_to_cores(10.0) == 0.0          # cannot go negative
+
+
+def test_guard_budget_matches_the_watt_cap():
+    g = Guard(budget_cores=0.0, charger_watts=75.0)
+    assert g.budget_from_watts(75.0) == 8.0
+    assert g.budget_watts() == 15.0            # a zero core budget = base draw only
+    assert abs(g.est_watts(8.0) - 75.0) < 1e-9
+    assert g.over_cap(10.0) == 15.0             # 10 cores = 90 W, 15 W over
+    assert g.over_cap(4.0) == -30.0           # 4 cores = 45 W, 30 W under the cap
+
+
+def test_throttle_respects_the_watt_cap():
+    g = Guard(budget_cores=14.0, charger_watts=75.0)          # generous core budget
+    cap = min(g.budget_cores, g.budget_from_watts(g.charger_watts))
+    demands = {i: 1.0 for i in range(14)}
+    duty = compute_duty(demands, cap)
+    assert measured(duty, demands) <= 8.0 + 1e-9
+
+
+SAMPLE_POWER = """
+Power info:
+\tBattery Power: -21.34 W
+\tSystem Power: 96.20 W
+"""
+
+
+def test_parse_power_reads_watts():
+    p = parse_power(SAMPLE_POWER)
+    assert p["battery power"] == -21.34
+    assert p["system power"] == 96.20
+
+
+def test_parse_power_ignores_junk():
+    assert parse_power("nothing measurable here") == {}
