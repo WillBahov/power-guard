@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Launch the power guard at login. Install:
+     cp scripts/powerguard.plist ~/Library/LaunchAgents/com.powerguard.plist
+     launchctl load ~/Library/LaunchAgents/com.powerguard.plist
+     launchctl status com.powerguard
+     (remove with launchctl unload) Change the core budget in the args array.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.powerguard</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/will/Documents/Projects/power-guard/power_guard.py</string>
+        <string>guard</string>
+        <string>--auto</string>
+        <string>--budget-cores</string>
+        <string>8</string>
+        <string>--quiet</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/powerguard.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/powerguard.log</string>
+</dict>
+</plist>
