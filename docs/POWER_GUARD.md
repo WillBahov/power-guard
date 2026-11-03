@@ -63,7 +63,7 @@ SIGCONTs every process it stopped on exit or Ctrl-C. Stdlib only: `ps`, `pmset`,
 python3 power_guard.py status
 
 # hard cap the machine at 8 cores
-python3 power_guard.py guard --budget-cores 8
+python3 power_guard.py guard --budget-cores 8   # --ui is on in a terminal
 
 # self-calibrating, running in the background
 nohup python3 power_guard.py guard --auto --budget-cores 12 \

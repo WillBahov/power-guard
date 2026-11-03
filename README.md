@@ -19,18 +19,65 @@ processes with `SIGSTOP`/`SIGCONT` so total CPU converges on a core budget.
 
 ## Quick start
 
+### Option A - click it
+
+Double-click **`Power Guard.command`** in Finder (in
+`~/Documents/Projects/power-guard/`). Terminal opens, the guard starts in
+`--auto` mode with the live dashboard, and it keeps running until you press
+`q` or Ctrl-C.
+
+`power_guard.py` itself is also executable, so `./power_guard.py` does the same
+thing. If Finder refuses to run the `.command` file, make sure it is
+executable (`chmod +x "Power Guard.command"`) or right-click → *Open With* →
+Terminal.app.
+
+### Option B - from the shell
+
 ```bash
 cd /Users/will/Documents/Projects/power-guard
 
 # 1. see what is drawing power right now
-python3 power_guard.py status
+./power_guard.py status
 
 # 2. cap the machine at 8 cores, self-correcting off the battery
-python3 power_guard.py guard --budget-cores 8 --auto
+./power_guard.py guard --budget-cores 8 --auto
 ```
 
-Ctrl-C releases everything it stopped. That is the whole thing — the rest of
-this file is tuning, daemon setup and limits.
+Ctrl-C (or `q` in the dashboard) releases every stopped process. That is the
+whole thing — the rest of this file is the dashboard, tuning, daemon setup and
+limits.
+
+---
+
+## The dashboard
+
+`guard` runs a live dashboard whenever stdout is a terminal (use `--no-ui` for
+the plain one-line-per-tick log, which is what the LaunchAgent uses). It shows:
+
+```
+ POWER GUARD  ·  14 cores  ·  15:20:46  ·  AC
+ charger 100 W   budget 6.0 cores   mode auto   tick 1.0s   headroom +75 W
+ load  ████░░░░░░░░░░░░░░░░│░░░░░░░░░░░░░░░░░░░░░░░░
+       1.29 cores busy  est ~25 W   soc 77%  False
+ trend  ▄▅▁▇▂▃▂   last 6 ticks
+ throttle: 3 processes held back   lost -1% in 3 min (14 W over the adapter) -> budget 5.0 cores
+   pid    process                  demand   duty
+   22580  node                     1.29   100%
+   437964 com.apple.WebKit.WebCo   0.61    60%
+```
+
+The `│` in the load bar is the budget; the sparkline is the last 40 ticks. Keys
+are read without blocking the control loop:
+
+| Key | Effect |
+|---|---|
+| `+` / `-` | Raise or lower the core budget by 1 (2 cores minimum) |
+| `a` | Toggle `--auto` battery feedback |
+| `p` | Pause / resume the throttle (budget is kept) |
+| `q` | Quit — releases every stopped process |
+
+The dashboard is stdlib `curses`, and the rendering helpers (`gauge`, `spark`,
+`fmt_rows`, `head`) are pure functions covered by `tests/test_tui.py`.
 
 ---
 
@@ -128,6 +175,7 @@ headroom instead.
 
 | Flag | Applies to | Default | Meaning |
 |---|---|---|---|
+| `--ui` / `--no-ui` | `guard` | dashboard on in a terminal, off otherwise | Live dashboard vs plain log |
 | `--budget-cores N` | `guard`, `status` | `8`, or the saved value with `--auto` | Target total CPU in core-equivalents |
 | `--auto` | `guard` | off | Steer the budget off measured battery drain |
 | `--fb-window S` | `guard` | `180` | Seconds of SOC history before a correction is made |
@@ -191,7 +239,10 @@ i.e. under 2 cores. Expect `--auto` to converge over a few windows (5–10 min).
 
 | Path | What it is |
 |---|---|
-| `power_guard.py` | The tool — single file, stdlib only |
+| `power_guard.py` | The tool — stdlib only, executable |
+| `tui.py` | The curses dashboard (render helpers are pure and tested) |
+| `Power Guard.command` | Double-click to start the guard in Terminal |
+| `power-guard` | Same thing, for a name on `PATH` |
 | `scripts/powerguard.plist` | LaunchAgent template for auto-start at login |
 | `tests/test_power_guard.py` | Pytest suite (scheduler convergence, SOC→watts math, protected list) |
 | `docs/POWER_GUARD.md` | Design notes: measurements, control theory, verification |
@@ -202,7 +253,7 @@ i.e. under 2 cores. Expect `--auto` to converge over a few windows (5–10 min).
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_power_guard.py -q
+python3 -m pytest tests/ -q        # 17 tests: scheduler, watts math, dashboard rendering
 ```
 
 No machine state is required — the suite runs the scheduler against a simulated

@@ -38,6 +38,8 @@ import subprocess
 import sys
 import time
 
+from tui import Dashboard, HAS_CURSES
+
 CONFIG_PATH = os.path.expanduser("~/.config/power_guard.json")
 
 # Never stop these: they freeze the display or the system.
@@ -160,6 +162,7 @@ class LoadSampler:
         self.scope = scope
         self.exclude = set(PROTECTED) | (exclude or set())
         self.prev: dict[int, tuple[float, float]] = {}
+        self.last: dict[int, str] = {}   # pid -> name from the most recent sample
 
     def sample(self) -> dict[int, float]:
         now = time.monotonic()
@@ -173,6 +176,7 @@ class LoadSampler:
             else:
                 demands[pid] = 0.0
             self.prev[pid] = (now, cpu)
+            self.last[pid] = name
         return demands
 
     def names(self, pids) -> list[str]:
@@ -233,6 +237,7 @@ class Guard:
         self.exclude = exclude
         self.duty: dict[int, float] = {}
         self.stopped: set[int] = set()
+        self.paused = False
         self.history: list[tuple[float, int, float]] = []
 
     def est_watts(self, cores: float) -> float:
@@ -298,12 +303,16 @@ class Guard:
         time.sleep(max(0.0, self.tick - elapsed))
 
     def run(self, duration: float | None = None, quiet: bool = False,
-            stop_when=None) -> None:
+            stop_when=None, ui: bool = False) -> None:
         sampler = LoadSampler(scope=self.scope, exclude=self.exclude)
         sampler.sample()
         end = None if duration is None else time.time() + duration
-        print(f"power_guard: charger {self.charger_watts} W, budget {self.budget_cores:.1f} "
-              f"cores of {self.max_cores}, tick {self.tick}s  (Ctrl-C to release)", flush=True)
+        board = Dashboard(self) if (ui and HAS_CURSES and sys.stdout.isatty()) else None
+        if board:
+            board.start()
+        else:
+            print(f"power_guard: charger {self.charger_watts} W, budget {self.budget_cores:.1f} "
+                  f"cores of {self.max_cores}, tick {self.tick}s  (Ctrl-C to release)", flush=True)
         try:
             while True:
                 if stop_when is not None and stop_when():
@@ -331,22 +340,41 @@ class Guard:
                 demands = sampler.sample()
                 cores = sum(demands.values())
                 note = self.steer(t0, st["soc"], cores)
-                self.duty = compute_duty(demands, self.budget_cores, self.duty, self.floor)
+                if self.paused:
+                    self.duty = {}
+                else:
+                    self.duty = compute_duty(demands, self.budget_cores, self.duty, self.floor)
                 throttle = {p: f for p, f in self.duty.items() if f < 0.999}
 
-                if not quiet:
-                    print(f"{time.strftime('%H:%M:%S')} soc={st['soc']}% cpu={cores:5.2f} "
+                snap = {
+                    "clock": time.strftime("%H:%M:%S"),
+                    "soc": st["soc"], "source": st["source"], "charging": st["charging"],
+                    "cores": cores, "watts": self.est_watts(cores),
+                    "budget": self.budget_cores, "throttled": len(throttle), "note": note,
+                    "top": [(pid, sampler.last.get(pid, "?"), d, self.duty.get(pid, 1.0))
+                            for pid, d in sorted(demands.items(), key=lambda kv: -kv[1])[:6]],
+                }
+                if board:
+                    board.render(snap)
+                elif not quiet:
+                    print(f"{snap['clock']} soc={st['soc']}% cpu={cores:5.2f} "
                           f"cores est~{self.est_watts(cores):4.0f} W "
                           f"budget={self.budget_cores:.1f} throttled={len(throttle)}  {note}",
                           flush=True)
                 if self.auto:
                     self._save()
                 self._apply(throttle)
+                if board:
+                    board.poll_keys()
+                    if board.quit:
+                        break
                 if end and time.time() > end:
                     break
         except KeyboardInterrupt:
             pass
         finally:
+            if board:
+                board.stop()
             sampler.release_all()
             log("power_guard: released all stopped processes")
 
@@ -395,7 +423,8 @@ def cmd_guard(a: argparse.Namespace) -> None:
           w_per_core=a.w_per_core, auto=a.auto, floor_cores=a.floor,
           battery_wh=a.battery_wh, fb_window=a.fb_window,
           exclude=set(a.exclude)).run(
-        duration=a.duration, quiet=a.quiet)
+        duration=a.duration, quiet=a.quiet,
+        ui=(not a.no_ui and (a.ui or sys.stdout.isatty())))
 
 
 def cmd_wrap(a: argparse.Namespace) -> None:
@@ -459,7 +488,7 @@ def main() -> None:
 
     p = argparse.ArgumentParser(description="Keep a plugged-in MacBook off the battery "
                                 "by capping aggregate CPU load.")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd")
 
     sp = sub.add_parser("status", parents=[common], help="power state + who is eating the CPU")
     sp.add_argument("--budget-cores", type=float, default=8.0)
@@ -481,6 +510,8 @@ def main() -> None:
     sg.add_argument("--exclude", action="append", default=[],
                     help="process name to never stop (repeatable)")
     sg.add_argument("--quiet", action="store_true", help="no per-tick output")
+    sg.add_argument("--ui", action="store_true", help="live dashboard (default in a terminal)")
+    sg.add_argument("--no-ui", action="store_true", help="plain one-line-per-tick log")
     sg.set_defaults(fn=cmd_guard)
 
     sw = sub.add_parser("wrap", parents=[common], help="run one command capped to N cores")
@@ -494,6 +525,8 @@ def main() -> None:
     sc.set_defaults(fn=cmd_calibrate)
 
     args = p.parse_args()
+    if args.cmd is None:                      # double-click / bare run: guard --auto
+        args = p.parse_args(["guard", "--auto"])
     args.fn(args)
 
 
