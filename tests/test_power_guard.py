@@ -84,14 +84,14 @@ def test_auto_steering_corrects_once_per_window():
 
 def test_watts_to_cores_conversion():
     # 75 W cap, 15 W base, 7.5 W/core -> 8 cores, which is the default budget
-    assert watts_to_cores(75.0) == 8.0
-    assert abs(watts_to_cores(100.0) - 11.333) < 1e-3
-    assert watts_to_cores(15.0) == 0.0
-    assert watts_to_cores(10.0) == 0.0          # cannot go negative
+    assert watts_to_cores(75.0, idle_watts=15.0) == 8.0
+    assert abs(watts_to_cores(100.0, idle_watts=15.0) - 11.333) < 1e-3
+    assert watts_to_cores(15.0, idle_watts=15.0) == 0.0
+    assert watts_to_cores(10.0, idle_watts=15.0) == 0.0   # cannot go negative
 
 
 def test_guard_budget_matches_the_watt_cap():
-    g = Guard(budget_cores=0.0, charger_watts=75.0)
+    g = Guard(budget_cores=0.0, charger_watts=75.0, idle_watts=15.0)
     assert g.budget_from_watts(75.0) == 8.0
     assert g.budget_watts() == 15.0            # a zero core budget = base draw only
     assert abs(g.est_watts(8.0) - 75.0) < 1e-9
@@ -150,3 +150,17 @@ def test_iterating_the_controller_settles_at_the_budget():
         seen.append(sum(d * duty.get(pid, 1.0) for pid, d in inherent.items()))
     # bounded sawtooth around the budget, never more than half a core off
     assert max(abs(v - 6.0) for v in seen) <= 0.5
+
+
+def test_measured_overdraw_lowers_the_budget():
+    g = Guard(budget_cores=12.0, charger_watts=75.0, idle_watts=15.0)
+    note = g.apply_sensor("no sensor", 10.0,
+                          {"name": "Stats", "dc_in": 90.0, "battery": -15.0})
+    assert g.budget_cores < 12.0
+    assert "15 W over the 75 W cap" in note
+
+
+def test_headroom_caps_the_budget_at_the_ceiling():
+    g = Guard(budget_cores=14.0, charger_watts=75.0, idle_watts=15.0)
+    g.apply_sensor("no sensor", 4.0, {"name": "Stats", "dc_in": 40.0, "battery": 1.0})
+    assert g.budget_cores <= 8.0            # (75 - 15) / 7.5 = 8 cores

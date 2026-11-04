@@ -54,11 +54,16 @@ def head(guard, snap) -> list[str]:
     """The top block of the dashboard: what is configured and what is happening."""
     adapter = snap.get("cap", guard.charger_watts)
     ceiling = min(adapter, snap.get("budget_watts", guard.budget_watts()))
-    over = snap["watts"] - ceiling
-    if over > 0:
-        gap = "OVER the %d W ceiling by %.0f W - throttling" % (ceiling, over)
+    feed = snap.get("feed")
+    if feed and feed.get("dc_in") is not None:
+        real = feed["dc_in"]
+        gap = ("%.0f W in from the adapter - %s" %
+               (real, "OVER the %d W ceiling" % ceiling if real > ceiling
+                      else "%.0f W spare" % (ceiling - real)))
     else:
-        gap = "under the %d W ceiling, %.0f W headroom" % (ceiling, -over)
+        over = snap["watts"] - ceiling
+        gap = ("OVER the %d W ceiling by %.0f W - throttling" % (ceiling, over) if over > 0
+               else "under the %d W ceiling, %.0f W headroom" % (ceiling, -over))
     state = "PAUSED" if guard.paused else ("auto" if guard.auto else "fixed")
     return [
         " POWER GUARD  ·  %d cores  ·  %s  ·  %s" % (guard.max_cores, snap["clock"], snap["source"]),

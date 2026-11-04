@@ -191,6 +191,7 @@ headroom instead.
 |---|---|---|---|
 | `--ui` / `--no-ui` | `guard` | dashboard on in a terminal, off otherwise | Live dashboard vs plain log |
 | `--charger-watts W` | all | `75` | The watt ceiling the guard acts at |
+| `--sensor` | `guard`, `power` | `auto` | `stats`, `sudo`, `soc` or auto-detect |
 | `--budget-watts W` | `guard` | same as `--charger-watts` | Engage when the estimated draw hits W |
 | `--budget-cores N` | `guard`, `status` | derived from the watt cap | Pin the budget in cores |
 | `--idle-watts W` | all | `15` | Base draw of an otherwise idle machine |
@@ -229,37 +230,41 @@ i.e. under 2 cores. Expect `--auto` to converge over a few windows (5–10 min).
 
 ---
 
-## Why the guard estimates watts instead of reading them
+## Where the watt measurement comes from
 
-macOS does not expose adapter or wall power to ordinary programs. Checked on
-this machine:
+macOS does not expose adapter or wall power through a public API, but the
+**Stats** app (`eu.exelban.Stats`) already samples the SMC every ~50 seconds
+and writes the readings into its own LevelDB:
 
-* `powermetrics --samplers power` — the only tool that reports instantaneous
-  watts, and it is root-only (`sudo: a password is required`).
-* `ioreg` — no battery, adapter or SMC power keys are visible without root.
-* `pmset -g batt` and `system_profiler SPPowerDataType` — source and integer
-  state of charge only, no current or voltage.
-
-So the guard uses two signals:
-
-1. **An estimate** — `15 W idle + 7.5 W per busy core`, checked against the
-   `--charger-watts` ceiling (75 W default). Fast, per tick.
-2. **A real measurement** — battery drift. If SOC falls while on AC, the
-   machine is genuinely drawing more than the adapter supplies, and `--auto`
-   lowers the budget until the fall stops. Slow (1% resolution) but it does not
-   care *why* the draw is high — GPU, display or CPU.
-
-If you are willing to give the tool sudo, it can close the loop on actual
-watts:
-
-```bash
-./power_guard.py power                     # what telemetry this machine will give
-./power_guard.py guard --auto --power      # throttle on real measured watts each tick
+```
+~/Library/Application Support/Stats/lldb
+  {"adapterPower": 62.4, "batteryPower": -11.2, "ACwatts": 94, "level": 0.76, ...}
 ```
 
-`--power` runs `sudo -n powermetrics`, which only works if sudo is passwordless
-for that command (or if you start the guard with `sudo`). Without it the guard
-silently falls back to the estimate plus battery drift.
+`adapterPower` is the "DC in" number you see in Stats, `batteryPower` is
+positive while the battery charges and negative while it feeds the machine, and
+`ACwatts` is what the adapter claims to be able to deliver. It is the user's own
+file, so reading it needs no privileges. `./power_guard.py power` prints the
+current reading and tells you which source is live.
+
+The guard uses the best source it can find:
+
+| Source | What it gives | Needs |
+|---|---|---|
+| Stats (`--sensor stats`, default) | DC-in watts, battery watts, adapter rating, ~50 s cadence | Stats installed and running |
+| `sudo powermetrics` (`--sensor sudo`) | instantaneous watts | passwordless sudo for that command |
+| Battery SOC drift (`--sensor soc`) | real overdraw, but only 1% resolution | nothing |
+
+With a live feed the guard does two things beyond the simple cap:
+
+* **Direct trigger.** If DC-in exceeds `--charger-watts`, or the battery is
+  discharging at all, the budget is cut by that many watts worth of cores.
+* **Self-calibration.** Consecutive samples give Δwatts / Δcores, which is the
+  true watts-per-core for this machine, so the `7.5 W per core` constant drifts
+  toward reality while the guard runs.
+
+If Stats is not installed, everything still works - the guard falls back to the
+CPU estimate plus battery drift.
 
 ---
 

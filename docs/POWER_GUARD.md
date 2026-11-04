@@ -5,7 +5,10 @@
 The adapter is rated 100 W but sustains about 75 W in practice. When the machine
 wants more than that, macOS does not clamp the load - the battery quietly
 supplies the difference. That is why the guard defaults to `--charger-watts 75`
-and derives its core budget from the cap: `(75 - 15) / 7.5 = 8 cores`. There is no
+and derives its core budget from the cap: `(75 - 15) / 7.5 = 8 cores`. The
+watt number itself comes from the Stats app's SMC samples (its LevelDB holds
+`adapterPower`, `batteryPower` and `ACwatts`), which is the closest thing to a
+real power meter that a non-root process can read. There is no
 `pmset` setting, no System Settings toggle and no API that says "run off the
 adapter only". The only lever a program has is the load itself.
 

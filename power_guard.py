@@ -38,6 +38,7 @@ import subprocess
 import sys
 import time
 
+from sensor import StatsSensor, live_power, parse_power, sensor_feed
 from tui import Dashboard, HAS_CURSES
 
 CONFIG_PATH = os.path.expanduser("~/.config/power_guard.json")
@@ -56,7 +57,7 @@ PROTECTED = {
 # base load. Only used to translate watts into cores; --auto corrects it from
 # actual battery drift.
 W_PER_CORE = 7.5
-IDLE_W = 15.0
+IDLE_W = 20.0
 CHARGER_W = 75.0        # measured continuous delivery of the adapter
 
 
@@ -275,7 +276,7 @@ class Guard:
                  floor_cores: float = 0.2, battery_wh: float = 71.0,
                  fb_window: float = 180.0, scope: set | None = None,
                  root_pid: int | None = None, exclude: set | None = None,
-                 live_power_feed: bool = False):
+                 sensor: str = "auto"):
         self.budget_cores = budget_cores
         self.max_cores = n_cores()
         self.tick = tick
@@ -293,8 +294,11 @@ class Guard:
         self.stopped: set[int] = set()
         self.paused = False
         self.history: list[tuple[float, int, float]] = []
-        self.power_feed = live_power_feed
-        self.last_watts: float | None = None
+        self.sensor = sensor
+        self.stats = StatsSensor() if sensor in ("auto", "stats") else None
+        self.use_sudo = sensor in ("auto", "sudo")
+        self.last_feed: dict | None = None
+        self.prev_feed: tuple | None = None      # (dc_in W, cores) last sample
 
     def est_watts(self, cores: float) -> float:
         """Ballpark system draw; the --auto loop uses real battery drift."""
@@ -321,6 +325,51 @@ class Guard:
                       open(CONFIG_PATH, "w"))
         except Exception:
             pass
+
+    def apply_sensor(self, fallback: str, cores: float, feed: dict | None = None) -> str:
+        """Steer the budget on measured watts when a sensor is reachable.
+
+        `dc_in` is the power the adapter is actually delivering; when the
+        machine wants more than that, the battery supplies the gap and
+        `battery` goes negative. Either one is a direct trigger to throttle -
+        far faster than waiting for state of charge to move a whole percent.
+        """
+        if feed is None:
+            feed = sensor_feed(self.stats, self.use_sudo)
+        if not feed:
+            return fallback
+        self.last_feed = feed
+        dc = feed.get("dc_in")
+        batt = feed.get("battery")
+
+        # Consecutive real samples let the model calibrate itself: the change
+        # in watts divided by the change in cores is the true watts-per-core.
+        if dc is not None and self.prev_feed is not None:
+            p_dc, p_cores = self.prev_feed
+            dcores = cores - p_cores
+            ddc = dc - p_dc
+            if abs(dcores) >= 1.0 and abs(ddc) >= 5.0:
+                w = ddc / dcores
+                if 1.0 <= w <= 12.0:
+                    self.w_per_core = 0.7 * self.w_per_core + 0.3 * w
+                self.idle_watts = max(5.0, dc - self.w_per_core * cores)
+        self.prev_feed = (dc, cores)
+
+        ceiling_cores = max(2.0, self.budget_from_watts(self.charger_watts))
+        over = 0.0
+        if dc is not None and dc > self.charger_watts:
+            over = dc - self.charger_watts
+        if batt is not None and batt < 0:
+            over = max(over, -batt)          # battery is feeding the difference
+        if over > 0:
+            self.budget_cores = max(2.0, min(self.budget_cores, ceiling_cores)
+                                    - over / self.w_per_core)
+            return (f"{feed['name']}: {dc:.0f} W in, {over:.0f} W over the "
+                    f"{self.charger_watts:.0f} W cap -> budget {self.budget_cores:.1f} cores")
+        self.budget_cores = min(self.budget_cores, ceiling_cores)
+        spare = (self.charger_watts - dc) if dc is not None else 0.0
+        return (f"{feed['name']}: {dc:.0f} W in, {spare:.0f} W spare, ceiling "
+                f"{ceiling_cores:.1f} cores ({self.w_per_core:.1f} W/core)")
 
     def steer(self, now: float, soc: int | None, cores: float) -> str:
         """AIMD, once per feedback window: battery losing charge means the
@@ -408,17 +457,7 @@ class Guard:
                 demands = sampler.sample()
                 cores = sum(demands.values())
                 note = self.steer(t0, st["soc"], cores)
-                if self.power_feed:
-                    watts = live_power()
-                    if watts:
-                        self.last_watts = watts.get("battery power")
-                        over = self.over_cap(-self.last_watts) if self.last_watts is not None else 0.0
-                        # the adapter is genuinely short: shave the budget now
-                        if over > 0:
-                            self.budget_cores = max(2.0, self.budget_cores - over / self.w_per_core)
-                            note = f"measured {self.last_watts:.1f} W from battery -> budget {self.budget_cores:.1f} cores"
-                        else:
-                            note = "measured battery power %.1f W, no overdraw" % (self.last_watts or 0.0)
+                note = self.apply_sensor(note, cores)
                 if self.paused:
                     self.duty = {}
                 else:
@@ -434,7 +473,7 @@ class Guard:
                     "cores": cores, "watts": self.est_watts(cores),
                     "budget": self.budget_cores, "throttled": len(throttle), "note": note,
                     "cap": self.charger_watts, "over": self.over_cap(cores),
-                    "measured_watts": self.last_watts,
+                    "feed": self.last_feed,
                     "budget_watts": self.budget_watts(),
                     "top": [(pid, sampler.last.get(pid, "?"), d, self.duty.get(pid, 1.0))
                             for pid, d in sorted(demands.items(), key=lambda kv: -kv[1])[:6]],
@@ -524,7 +563,7 @@ def cmd_guard(a: argparse.Namespace) -> None:
     Guard(budget_cores=budget, tick=a.tick, charger_watts=a.charger_watts,
           w_per_core=a.w_per_core, auto=a.auto, floor_cores=a.floor,
           battery_wh=a.battery_wh, fb_window=a.fb_window,
-          exclude=set(a.exclude), live_power_feed=a.power).run(
+          exclude=set(a.exclude), sensor=a.sensor).run(
         duration=a.duration, quiet=a.quiet,
         ui=(not a.no_ui and (a.ui or sys.stdout.isatty())), debug=a.debug)
 
@@ -546,17 +585,24 @@ def cmd_wrap(a: argparse.Namespace) -> None:
 def cmd_power(a: argparse.Namespace) -> None:
     """Report which power telemetry this machine will actually give us."""
     st = power_state()
-    print(f"power source : {st['source']}, soc {st['soc']}%, charging={st['charging']}")
-    print(f"estimated CPU draw (idle {a.idle_watts:.0f} W + {a.w_per_core} W/core) "
-          f"against a {a.charger_watts:.0f} W ceiling")
-    watts = live_power()
-    if watts:
-        print("powermetrics  : available -", ", ".join(f"{k} {v:.1f} W" for k, v in watts.items()))
-        print("the guard can close the loop on real watts with --power")
+    print(f"power source  : {st['source']}, soc {st['soc']}%, charging={st['charging']}")
+    print(f"ceiling used  : {a.charger_watts:.0f} W (idle {a.idle_watts:.0f} W + "
+          f"{a.w_per_core} W per loaded core)")
+    feed = sensor_feed(StatsSensor(), getattr(a, "sensor", "auto") in ("auto", "sudo"))
+    if feed:
+        print(f"live sensor   : {feed['name']}")
+        if feed.get("dc_in") is not None:
+            print(f"  DC in       : {feed['dc_in']:.1f} W")
+        if feed.get("battery") is not None:
+            b = feed["battery"]
+            print(f"  battery     : {b:+.1f} W ({'charging' if b >= 0 else 'draining'})")
+        if feed.get("adapter_rating"):
+            print(f"  adapter rated: {feed['adapter_rating']:.0f} W")
     else:
-        print("powermetrics  : not readable without a password, so the guard uses "
-              "the CPU estimate plus the battery drift (which is a real measurement "
-              "of overdraw, just slower)")
+        print("live sensor   : none reachable. Stats is not installed or not "
+              "running, and sudo powermetrics needs a password. The guard then "
+              "steers on battery state of charge drift - a real measurement of "
+              "overdraw, just slower.")
 
 
 def cmd_calibrate(a: argparse.Namespace) -> None:
@@ -639,8 +685,9 @@ def main() -> None:
     sg.add_argument("--no-ui", action="store_true", help="plain one-line-per-tick log")
     sg.add_argument("--debug", action="store_true",
                     help="print per-process demand and duty each tick")
-    sg.add_argument("--power", action="store_true",
-                    help="close the loop on real watts from powermetrics (needs sudo)")
+    sg.add_argument("--sensor", choices=("auto", "stats", "sudo", "soc"), default="auto",
+                    help="watt source: Stats app (default if installed), "
+                         "sudo powermetrics, or battery state of charge only")
     sg.set_defaults(fn=cmd_guard)
 
     sw = sub.add_parser("wrap", parents=[common], help="run one command capped to N cores")
