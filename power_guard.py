@@ -58,7 +58,9 @@ PROTECTED = {
 # actual battery drift.
 W_PER_CORE = 7.5
 IDLE_W = 20.0
-CHARGER_W = 75.0        # measured continuous delivery of the adapter
+CHARGER_W = 85.0        # measured knee: above this the battery starts contributing
+MAX_CHARGER_W = 100.0   # the most the machine will accept
+BATTERY_MARGIN = 0.0    # any negative battery power means the battery is feeding
 
 
 def log(msg: str) -> None:
@@ -271,7 +273,7 @@ def compute_duty(demands: dict[int, float], budget_cores: float,
 # --------------------------------------------------------------- the guard
 class Guard:
     def __init__(self, budget_cores: float, tick: float = 1.0,
-                 charger_watts: float = CHARGER_W, w_per_core: float = W_PER_CORE,
+                 charger_watts: float | None = None, w_per_core: float = W_PER_CORE,
                  idle_watts: float = IDLE_W, auto: bool = False,
                  floor_cores: float = 0.2, battery_wh: float = 71.0,
                  fb_window: float = 180.0, scope: set | None = None,
@@ -279,6 +281,7 @@ class Guard:
                  sensor: str = "auto"):
         self.budget_cores = budget_cores
         self.max_cores = n_cores()
+        self.adapter_rating: float | None = None   # what the plugged-in charger reports
         self.tick = tick
         self.charger_watts = charger_watts
         self.w_per_core = w_per_core
@@ -300,6 +303,11 @@ class Guard:
         self.last_feed: dict | None = None
         self.prev_feed: tuple | None = None      # (dc_in W, cores) last sample
 
+    def ceiling_watts(self) -> float:
+        """The ceiling to act on: an explicit --charger-watts wins, otherwise the
+        rating the connected adapter reports (Stats' ACwatts), otherwise 100 W."""
+        return self.charger_watts or self.adapter_rating or CHARGER_W
+
     def est_watts(self, cores: float) -> float:
         """Ballpark system draw; the --auto loop uses real battery drift."""
         return self.idle_watts + self.w_per_core * cores
@@ -314,13 +322,13 @@ class Guard:
 
     def over_cap(self, cores: float) -> float:
         """How far the estimated draw exceeds the cap (positive = draining)."""
-        return self.est_watts(cores) - self.charger_watts
+        return self.est_watts(cores) - self.ceiling_watts()
 
     def _save(self) -> None:
         try:
             os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
             json.dump({"budget_cores": round(self.budget_cores, 2),
-                       "charger_watts": self.charger_watts,
+                       "ceiling_watts": self.ceiling_watts(),
                        "learned_at": time.strftime("%Y-%m-%d %H:%M:%S")},
                       open(CONFIG_PATH, "w"))
         except Exception:
@@ -344,6 +352,8 @@ class Guard:
 
         # Consecutive real samples let the model calibrate itself: the change
         # in watts divided by the change in cores is the true watts-per-core.
+        if rating := feed.get("adapter_rating"):
+            self.adapter_rating = float(rating)
         if dc is not None and self.prev_feed is not None:
             p_dc, p_cores = self.prev_feed
             dcores = cores - p_cores
@@ -355,21 +365,24 @@ class Guard:
                 self.idle_watts = max(5.0, dc - self.w_per_core * cores)
         self.prev_feed = (dc, cores)
 
-        ceiling_cores = max(2.0, self.budget_from_watts(self.charger_watts))
-        over = 0.0
-        if dc is not None and dc > self.charger_watts:
-            over = dc - self.charger_watts
-        if batt is not None and batt < 0:
-            over = max(over, -batt)          # battery is feeding the difference
-        if over > 0:
+        ceiling = self.ceiling_watts()
+        ceiling_cores = max(2.0, self.budget_from_watts(ceiling))
+
+        # The battery is the reference: it can only give power if the adapter
+        # cannot cover the demand, so a negative battery power is a direct
+        # measurement of overdraw - independent of which charger is plugged in.
+        if batt is not None and batt < BATTERY_MARGIN:
             self.budget_cores = max(2.0, min(self.budget_cores, ceiling_cores)
-                                    - over / self.w_per_core)
-            return (f"{feed['name']}: {dc:.0f} W in, {over:.0f} W over the "
-                    f"{self.charger_watts:.0f} W cap -> budget {self.budget_cores:.1f} cores")
-        self.budget_cores = min(self.budget_cores, ceiling_cores)
-        spare = (self.charger_watts - dc) if dc is not None else 0.0
-        return (f"{feed['name']}: {dc:.0f} W in, {spare:.0f} W spare, ceiling "
-                f"{ceiling_cores:.1f} cores ({self.w_per_core:.1f} W/core)")
+                                    - (-batt) / self.w_per_core)
+            return (f"{feed['name']}: battery giving {-batt:.1f} W, adapter "
+                    f"{dc:.0f} W of {ceiling:.0f} W -> budget {self.budget_cores:.1f} cores")
+        if dc is not None and dc >= 0.92 * ceiling:
+            self.budget_cores = min(self.budget_cores, ceiling_cores)
+            return (f"{feed['name']}: adapter pegged at {dc:.0f} W of {ceiling:.0f} W, "
+                    f"budget held at {self.budget_cores:.1f} cores")
+        self.budget_cores = min(ceiling_cores, self.budget_cores + 1.0)
+        return (f"{feed['name']}: {dc:.0f} W in, battery {batt:+.1f} W, ceiling "
+                f"{ceiling:.0f} W = {ceiling_cores:.1f} cores ({self.w_per_core:.1f} W/core)")
 
     def steer(self, now: float, soc: int | None, cores: float) -> str:
         """AIMD, once per feedback window: battery losing charge means the
@@ -428,8 +441,9 @@ class Guard:
         if board:
             board.start()
         else:
-            print(f"power_guard: charger {self.charger_watts} W, budget {self.budget_cores:.1f} "
-                  f"cores of {self.max_cores}, tick {self.tick}s  (Ctrl-C to release)", flush=True)
+            print(f"power_guard: ceiling {self.ceiling_watts():.0f} W, "
+                  f"budget {self.budget_cores:.1f} cores of {self.max_cores}, "
+                  f"tick {self.tick}s  (Ctrl-C to release)", flush=True)
         try:
             while True:
                 if stop_when is not None and stop_when():
@@ -463,7 +477,8 @@ class Guard:
                 else:
                     # the cap can be lowered mid-run with --charger-watts, so
                     # re-derive it every tick and never exceed it
-                    cap_cores = min(self.budget_cores, self.budget_from_watts(self.charger_watts))
+                    cap_cores = min(self.budget_cores,
+                                    self.budget_from_watts(self.ceiling_watts()))
                     self.duty = compute_duty(demands, cap_cores, self.duty, self.floor)
                 throttle = {p: f for p, f in self.duty.items() if f < 0.999}
 
@@ -472,7 +487,7 @@ class Guard:
                     "soc": st["soc"], "source": st["source"], "charging": st["charging"],
                     "cores": cores, "watts": self.est_watts(cores),
                     "budget": self.budget_cores, "throttled": len(throttle), "note": note,
-                    "cap": self.charger_watts, "over": self.over_cap(cores),
+                    "cap": self.ceiling_watts(), "over": self.over_cap(cores),
                     "feed": self.last_feed,
                     "budget_watts": self.budget_watts(),
                     "top": [(pid, sampler.last.get(pid, "?"), d, self.duty.get(pid, 1.0))
@@ -544,7 +559,9 @@ def _saved_budget() -> float | None:
 
 
 def cmd_guard(a: argparse.Namespace) -> None:
-    cap = a.budget_watts if a.budget_watts is not None else a.charger_watts
+    probe = sensor_feed(StatsSensor(), a.sensor in ("auto", "sudo"))
+    rating = (probe or {}).get("adapter_rating")
+    cap = a.budget_watts or a.charger_watts or rating or CHARGER_W
     learned = _saved_budget() if a.auto else None
     if a.budget_cores is not None:
         budget, why = a.budget_cores, "pinned"
@@ -554,8 +571,9 @@ def cmd_guard(a: argparse.Namespace) -> None:
         budget, why = watts_to_cores(cap, a.idle_watts, a.w_per_core), "from cap"
     max_cores = n_cores()
     cap_cores = watts_to_cores(cap, a.idle_watts, a.w_per_core)
-    print(f"power_guard: act at {cap:.0f} W -> budget {min(budget, max_cores):.1f} cores "
-          f"({why})", flush=True)
+    print(f"power_guard: ceiling {cap:.0f} W -> budget "
+          f"{min(budget, max_cores):.1f} cores ({why}); the battery sensor decides "
+          f"when to throttle", flush=True)
     if budget > cap_cores:
         print(f"note: {budget:.1f} cores is ~{a.idle_watts + a.w_per_core * budget:.0f} W, above "
               f"the {cap:.0f} W cap. The throttle will hold at {cap_cores:.1f} cores; raise "
@@ -586,8 +604,8 @@ def cmd_power(a: argparse.Namespace) -> None:
     """Report which power telemetry this machine will actually give us."""
     st = power_state()
     print(f"power source  : {st['source']}, soc {st['soc']}%, charging={st['charging']}")
-    print(f"ceiling used  : {a.charger_watts:.0f} W (idle {a.idle_watts:.0f} W + "
-          f"{a.w_per_core} W per loaded core)")
+    print(f"ceiling used  : {a.charger_watts or 'adapter rating, else 85'} W "
+          f"(idle {a.idle_watts:.0f} W + {a.w_per_core} W per loaded core)")
     feed = sensor_feed(StatsSensor(), getattr(a, "sensor", "auto") in ("auto", "sudo"))
     if feed:
         print(f"live sensor   : {feed['name']}")
@@ -648,8 +666,9 @@ def cmd_calibrate(a: argparse.Namespace) -> None:
 
 def main() -> None:
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--charger-watts", type=float, default=CHARGER_W,
-                    help="continuous W the adapter actually delivers (default 75)")
+    common.add_argument("--charger-watts", type=float, default=None,
+                    help="watt ceiling to act on. Omit it and the guard uses the "
+                         "rating the connected adapter reports (Stats ACwatts)")
     common.add_argument("--w-per-core", type=float, default=W_PER_CORE)
     common.add_argument("--idle-watts", type=float, default=IDLE_W,
                         help="base draw of an idle machine (default 15 W)")

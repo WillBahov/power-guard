@@ -155,12 +155,30 @@ def test_iterating_the_controller_settles_at_the_budget():
 def test_measured_overdraw_lowers_the_budget():
     g = Guard(budget_cores=12.0, charger_watts=75.0, idle_watts=15.0)
     note = g.apply_sensor("no sensor", 10.0,
-                          {"name": "Stats", "dc_in": 90.0, "battery": -15.0})
+                          {"name": "Stats", "dc_in": 90.0, "battery": -15.0,
+                           "adapter_rating": 75.0})
     assert g.budget_cores < 12.0
-    assert "15 W over the 75 W cap" in note
+    assert "battery giving 15.0 W" in note
 
 
 def test_headroom_caps_the_budget_at_the_ceiling():
     g = Guard(budget_cores=14.0, charger_watts=75.0, idle_watts=15.0)
     g.apply_sensor("no sensor", 4.0, {"name": "Stats", "dc_in": 40.0, "battery": 1.0})
     assert g.budget_cores <= 8.0            # (75 - 15) / 7.5 = 8 cores
+
+
+def test_ceiling_follows_the_connected_adapter():
+    g = Guard(budget_cores=14.0)                       # no explicit charger watts
+    assert g.ceiling_watts() == 85.0                   # measured knee for this machine
+    g.adapter_rating = 94.0                            # what the adapter reports
+    assert g.ceiling_watts() == 94.0
+    g.charger_watts = 75.0                             # an explicit cap wins
+    assert g.ceiling_watts() == 75.0
+    assert g.budget_from_watts(85.0) == (85.0 - 20.0) / 7.5
+
+
+def test_charging_battery_does_not_force_a_cut():
+    g = Guard(budget_cores=8.0, charger_watts=100.0, idle_watts=10.0)
+    g.apply_sensor("none", 6.0, {"name": "Stats", "dc_in": 60.0, "battery": 1.0,
+                                 "adapter_rating": 100.0})
+    assert g.budget_cores == 9.0                       # headroom, so it relaxes by 1

@@ -2,13 +2,16 @@
 
 ## Why this happens
 
-The adapter is rated 100 W but sustains about 75 W in practice. When the machine
-wants more than that, macOS does not clamp the load - the battery quietly
-supplies the difference. That is why the guard defaults to `--charger-watts 75`
-and derives its core budget from the cap: `(75 - 15) / 7.5 = 8 cores`. The
-watt number itself comes from the Stats app's SMC samples (its LevelDB holds
-`adapterPower`, `batteryPower` and `ACwatts`), which is the closest thing to a
-real power meter that a non-root process can read. There is no
+The adapter is rated 100 W, but CPU + GPU at full tilt only costs about 70 W,
+and the adapter's ~96 W peak is the fast-charging ceiling rather than a power
+ceiling for the machine. Total demand above roughly 82-85 W is where the battery
+starts contributing - the machine simply asks for more than the brick delivers.
+macOS does not clamp the load; the battery quietly supplies the difference. So
+the guard's rule is "never let the battery discharge", and the core budget is
+just the lever it uses to get there. The ceiling defaults to 85 W. The watt
+number itself comes from either `sudo powermetrics` or the Stats app's SMC
+samples (its LevelDB holds `adapterPower`, `batteryPower` and `ACwatts`), which
+is the closest thing to a real power meter a non-root process can read. There is no
 `pmset` setting, no System Settings toggle and no API that says "run off the
 adapter only". The only lever a program has is the load itself.
 

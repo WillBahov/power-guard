@@ -26,20 +26,35 @@ import time
 STATS_DB = os.path.expanduser('~/Library/Application Support/Stats/lldb')
 STALE_AFTER = 300.0          # Stats samples roughly every 50 s
 RECORD = re.compile(rb'\{[^{}]*adapterPower[^{}]*\}')
-POWER_CMD = ['sudo', '-n', 'powermetrics', '--samplers', 'power', '-i', '1000', '-n', '1']
+POWER_CMD = ['sudo', '-n', 'powermetrics', '--samplers', 'cpu_power', '-i', '1000', '-n', '1']
 
 
 def parse_power(text: str) -> dict:
-    """Instantaneous watts from powermetrics output, e.g. 'Battery Power: -12.4 W'."""
+    """Watts out of powermetrics output.
+
+    powermetrics prints values in mW or W, e.g.
+        CPU Power: 12345 mW
+        GPU Power: 2100 mW
+        Total Power: 14445 mW
+        Battery Power: -1200 mW
+    """
     out = {}
     for line in text.splitlines():
-        parts = line.split(':')
-        if len(parts) == 2 and 'power' in parts[0].lower():
-            value = parts[1].strip().replace('W', '').strip()
-            try:
-                out[parts[0].strip().lower()] = float(value)
-            except ValueError:
-                pass
+        if ':' not in line:
+            continue
+        label, value = line.split(':', 1)
+        if 'power' not in label.lower():
+            continue
+        value = value.strip()
+        unit = 'mW' if 'mW' in value else 'W'
+        number = value.replace(unit, '').replace('W', '').strip()
+        try:
+            watts = float(number)
+        except ValueError:
+            continue
+        if unit == 'mW':
+            watts /= 1000.0
+        out[label.strip().lower()] = watts
     return out
 
 
@@ -52,10 +67,16 @@ def live_power() -> dict | None:
     watts = parse_power(r.stdout)
     if not watts:
         return None
-    if 'battery power' in watts:
-        watts['dc_in'] = watts.get('system power')
-        watts['battery'] = watts['battery power']
-    return watts
+    return {
+        "name": "powermetrics",
+        "dc_in": watts.get("total power"),        # what the SoC is consuming
+        "battery": watts.get("battery power"),    # negative = battery is feeding
+        "cpu": watts.get("cpu power"),
+        "gpu": watts.get("gpu power"),
+        "adapter_rating": None,
+        "soc": None,
+        "charging": None,
+    }
 
 
 class StatsSensor:
@@ -100,25 +121,21 @@ class StatsSensor:
 
 
 def sensor_feed(stats: StatsSensor | None, use_sudo: bool) -> dict | None:
-    """{name, dc_in, battery, adapter_rating, cores_allowed} from the best source."""
+    """The best watt reading available: powermetrics first (accurate, needs root),
+    then the Stats app's cached SMC samples, then nothing."""
+    if use_sudo:
+        feed = live_power()
+        if feed:
+            return feed
     if stats is not None:
         rec = stats.reading()
         if rec:
-            dc = rec.get('adapterPower')
-            batt = rec.get('batteryPower')
-            rating = rec.get('ACwatts')
             return {
                 'name': 'Stats',
-                'dc_in': dc,
-                'battery': batt,
-                'adapter_rating': rating,
+                'dc_in': rec.get('adapterPower'),
+                'battery': rec.get('batteryPower'),
+                'adapter_rating': rec.get('ACwatts'),
                 'soc': round(rec.get('level', 0) * 100),
                 'charging': rec.get('isCharging', False),
             }
-    if use_sudo:
-        watts = live_power()
-        if watts:
-            return {'name': 'powermetrics', 'dc_in': watts.get('dc_in'),
-                    'battery': watts.get('battery'), 'adapter_rating': None,
-                    'soc': None, 'charging': None}
     return None

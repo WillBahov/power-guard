@@ -230,41 +230,50 @@ i.e. under 2 cores. Expect `--auto` to converge over a few windows (5–10 min).
 
 ---
 
-## Where the watt measurement comes from
+## How the power limit is measured
 
-macOS does not expose adapter or wall power through a public API, but the
-**Stats** app (`eu.exelban.Stats`) already samples the SMC every ~50 seconds
-and writes the readings into its own LevelDB:
+There is a widespread belief that a 100 W charger "cannot keep up" with a
+MacBook Pro. The sensors on this machine say otherwise:
 
-```
-~/Library/Application Support/Stats/lldb
-  {"adapterPower": 62.4, "batteryPower": -11.2, "ACwatts": 94, "level": 0.76, ...}
-```
+* CPU + GPU at 100 % costs roughly **70 W**.
+* The 100 W adapter peaks near **96 W of DC in**, and only while fast-charging.
+* Once total demand passes about **82-85 W**, the battery supplies whatever the
+  adapter cannot - observed as 84 W DC in plus 30 W from the battery for a
+  114 W total during a heavy render.
 
-`adapterPower` is the "DC in" number you see in Stats, `batteryPower` is
-positive while the battery charges and negative while it feeds the machine, and
-`ACwatts` is what the adapter claims to be able to deliver. It is the user's own
-file, so reading it needs no privileges. `./power_guard.py power` prints the
-current reading and tells you which source is live.
+So the guard's real rule is not "stay under 75 W". It is:
 
-The guard uses the best source it can find:
+> **Never let the battery discharge while the adapter is attached.**
+
+The core budget is only the means to that end. `--charger-watts` (default 85 W,
+or the rating the connected adapter reports) is the fallback ceiling used when
+no battery sensor is reachable.
+
+### Which sensors are readable
 
 | Source | What it gives | Needs |
 |---|---|---|
-| Stats (`--sensor stats`, default) | DC-in watts, battery watts, adapter rating, ~50 s cadence | Stats installed and running |
-| `sudo powermetrics` (`--sensor sudo`) | instantaneous watts | passwordless sudo for that command |
-| Battery SOC drift (`--sensor soc`) | real overdraw, but only 1% resolution | nothing |
+| `sudo powermetrics` | real CPU / GPU / battery watts, sub-second | root |
+| Stats app cache | DC in, battery watts, adapter rating, ~50 s cadence | Stats running |
+| Battery SOC drift | true overdraw, 1% resolution, minutes | nothing |
 
-With a live feed the guard does two things beyond the simple cap:
+Reading the SMC directly from an ordinary process is not possible: every SMC
+user client under `IODeviceTree:/arm-io/smc`, including `smc-charger-util`,
+refuses `IOServiceOpen`, `ioreg` exposes no power properties, `top`'s POWER
+column is not watts, and `sysctl` has nothing. Stats can read those sensors
+because it ships with the entitlement.
 
-* **Direct trigger.** If DC-in exceeds `--charger-watts`, or the battery is
-  discharging at all, the budget is cut by that many watts worth of cores.
-* **Self-calibration.** Consecutive samples give Δwatts / Δcores, which is the
-  true watts-per-core for this machine, so the `7.5 W per core` constant drifts
-  toward reality while the guard runs.
+To make the guard independent of Stats, run it with sudo once:
 
-If Stats is not installed, everything still works - the guard falls back to the
-CPU estimate plus battery drift.
+```bash
+sudo ./power_guard.py guard --sensor sudo      # live watts from powermetrics
+```
+
+or give the tool a passwordless sudoers entry and stay unprivileged:
+
+```
+will ALL=(ALL) NOPASSWD: /usr/bin/powermetrics
+```
 
 ---
 

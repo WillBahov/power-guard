@@ -52,8 +52,8 @@ def fmt_rows(top) -> list[str]:
 
 def head(guard, snap) -> list[str]:
     """The top block of the dashboard: what is configured and what is happening."""
-    adapter = snap.get("cap", guard.charger_watts)
-    ceiling = min(adapter, snap.get("budget_watts", guard.budget_watts()))
+    adapter = snap.get("cap") or guard.ceiling_watts()
+    ceiling = min(adapter, snap.get("budget_watts") or guard.budget_watts())
     feed = snap.get("feed")
     if feed and feed.get("dc_in") is not None:
         real = feed["dc_in"]
