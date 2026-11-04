@@ -371,7 +371,7 @@ class Guard:
         time.sleep(max(0.0, self.tick - elapsed))
 
     def run(self, duration: float | None = None, quiet: bool = False,
-            stop_when=None, ui: bool = False) -> None:
+            stop_when=None, ui: bool = False, debug: bool = False) -> None:
         sampler = LoadSampler(scope=self.scope, exclude=self.exclude)
         sampler.sample()
         end = None if duration is None else time.time() + duration
@@ -439,6 +439,10 @@ class Guard:
                     "top": [(pid, sampler.last.get(pid, "?"), d, self.duty.get(pid, 1.0))
                             for pid, d in sorted(demands.items(), key=lambda kv: -kv[1])[:6]],
                 }
+                if debug:
+                    print(f"  total {cores:5.2f} | cap {self.budget_cores:.1f} | "
+                          + " | ".join(f"{name[:18]}={d:.2f}c duty{duty:.2f}"
+                                       for pid, name, d, duty in snap["top"][:8]), flush=True)
                 if board:
                     board.render(snap)
                 elif not quiet:
@@ -522,7 +526,7 @@ def cmd_guard(a: argparse.Namespace) -> None:
           battery_wh=a.battery_wh, fb_window=a.fb_window,
           exclude=set(a.exclude), live_power_feed=a.power).run(
         duration=a.duration, quiet=a.quiet,
-        ui=(not a.no_ui and (a.ui or sys.stdout.isatty())))
+        ui=(not a.no_ui and (a.ui or sys.stdout.isatty())), debug=a.debug)
 
 
 def cmd_wrap(a: argparse.Namespace) -> None:
@@ -633,6 +637,8 @@ def main() -> None:
     sg.add_argument("--quiet", action="store_true", help="no per-tick output")
     sg.add_argument("--ui", action="store_true", help="live dashboard (default in a terminal)")
     sg.add_argument("--no-ui", action="store_true", help="plain one-line-per-tick log")
+    sg.add_argument("--debug", action="store_true",
+                    help="print per-process demand and duty each tick")
     sg.add_argument("--power", action="store_true",
                     help="close the loop on real watts from powermetrics (needs sudo)")
     sg.set_defaults(fn=cmd_guard)
