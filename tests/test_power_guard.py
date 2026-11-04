@@ -122,3 +122,31 @@ def test_parse_power_reads_watts():
 
 def test_parse_power_ignores_junk():
     assert parse_power("nothing measurable here") == {}
+
+
+def test_many_small_processes_do_not_break_the_budget():
+    # 50 daemons at 0.1 cores each = 5 cores; a 3 core budget must still hold
+    demands = {i: 0.1 for i in range(50)}
+    duty = compute_duty(demands, 3.0, floor_cores=0.2)
+    assert measured(duty, demands) <= 3.0 + 1e-9
+
+
+def test_small_processes_are_spared_when_they_fit():
+    demands = {1: 5.0, 2: 0.1, 3: 0.1}
+    duty = compute_duty(demands, 4.0, floor_cores=0.2)
+    assert duty[2] == 1.0 and duty[3] == 1.0          # tiny ones never stopped
+    assert measured(duty, demands) <= 4.0 + 1e-9
+
+
+def test_iterating_the_controller_settles_at_the_budget():
+    """The loop feeds the controller what actually got through, not the
+    inherent demand, so duty compounds correctly and converges."""
+    inherent = {i: 1.0 for i in range(10)}
+    inherent.update({100 + i: 0.1 for i in range(20)})   # 2 cores of background
+    duty, seen = {}, []
+    for _ in range(30):
+        got_through = {pid: d * duty.get(pid, 1.0) for pid, d in inherent.items()}
+        duty = compute_duty(got_through, 6.0, duty, 0.2)
+        seen.append(sum(d * duty.get(pid, 1.0) for pid, d in inherent.items()))
+    # bounded sawtooth around the budget, never more than half a core off
+    assert max(abs(v - 6.0) for v in seen) <= 0.5

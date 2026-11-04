@@ -271,7 +271,9 @@ silently falls back to the estimate plus battery drift.
 * **Stopping is abrupt.** Duty-cycling stops processes for part of each tick.
   Apps with hard real-time deadlines (audio capture, video calls, latency
   sensitive simulations) can hiccup. Raise `--floor`, use `--exclude`, or use
-  `wrap` so only the job you chose is throttled.
+  `wrap` so only the job you chose is throttled. The floor is a courtesy, not a
+  guarantee: small processes are spared only while their combined load fits
+  inside the budget; beyond that everything is throttled proportionally.
 * **System processes are never stopped.** `WindowServer`, `loginwindow`,
   `powerd`, `coreservicesd`, `launchd`, `airportd`, `kernel_task` and friends
   are in `PROTECTED`.
@@ -315,8 +317,9 @@ load, so it verifies the controller converges rather than ringing.
 
 ## Verified on this machine
 
-* 14 busy loops under `guard --budget-cores 6`: load fell from 13.5 cores to
-  5.3–6.9 cores and held there for 20 ticks.
+* 12 busy loops under the default 75 W ceiling: load fell from ~14.6 cores to
+  2–3 cores and stayed inside the budget. A 3-core budget with 4 loops settled
+  at 1.7–2.9 cores after an initial transient.
 * `wrap --cores 3` on an 8-process multiprocessing job: held at 2.99–3.40 cores,
   exited cleanly when the job finished.
 * `calibrate --minutes 5` at full CPU load: 0 W drain — even a 100 W adapter covered

@@ -242,14 +242,28 @@ def compute_duty(demands: dict[int, float], budget_cores: float,
     prev = prev or {}
     total = sum(demands.values())
     duty: dict[int, float] = {}
-    for pid, d in demands.items():
-        p = prev.get(pid, 1.0)
-        if total <= budget_cores:
-            duty[pid] = min(1.0, p + 0.05)              # relax gradually
-        elif d < floor_cores:
-            duty[pid] = 1.0                             # idle processes are not worth stopping
-        else:
-            duty[pid] = max(0.0, min(1.0, p * budget_cores / total))
+
+    if total <= budget_cores:
+        for pid in demands:
+            duty[pid] = min(1.0, prev.get(pid, 1.0) + 0.05)   # relax gradually
+        return duty
+
+    # Processes under the floor are not worth stopping - but only if they fit
+    # inside the budget. A hundred daemons at 0.1 cores each are 10 cores, and
+    # exempting them would make the budget unreachable.
+    small = {pid: d for pid, d in demands.items() if d < floor_cores}
+    spare = sum(small.values())
+    if spare <= budget_cores:
+        left = budget_cores - spare
+        heavy_total = total - spare
+        for pid, d in demands.items():
+            if pid in small:
+                duty[pid] = 1.0
+            else:
+                duty[pid] = max(0.0, min(1.0, prev.get(pid, 1.0) * left / heavy_total))
+    else:
+        for pid, d in demands.items():
+            duty[pid] = max(0.0, min(1.0, prev.get(pid, 1.0) * budget_cores / total))
     return duty
 
 
