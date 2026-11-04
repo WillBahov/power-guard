@@ -202,6 +202,7 @@ headroom instead.
 | `--exclude NAME` | `guard` | — | Never stop this process (repeatable) |
 | `--battery-wh Wh` | `guard`, `calibrate` | `71` | Battery capacity, for converting SOC drift to watts |
 | `--duration S` | `guard` | run forever | Exit after N seconds |
+| `--debug` | `guard` | off | Print each process's demand and duty every tick |
 | `--quiet` | `guard` | off | Suppress the per-tick line |
 | `--cores N` | `wrap` | `8` | Cap for the wrapped command |
 
