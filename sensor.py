@@ -23,6 +23,8 @@ import os
 import subprocess
 import time
 
+from smartbattery import smart_battery_reading
+
 STATS_DB = os.path.expanduser('~/Library/Application Support/Stats/lldb')
 STALE_AFTER = 300.0          # Stats samples roughly every 50 s
 RECORD = re.compile(rb'\{[^{}]*adapterPower[^{}]*\}')
@@ -122,15 +124,21 @@ class StatsSensor:
 
 def sensor_feed(stats: StatsSensor | None, use_sudo: bool) -> dict | None:
     """The best watt reading available: powermetrics first (accurate, needs root),
-    then the Stats app's cached SMC samples, then nothing."""
+    then the Stats app's cached SMC samples, then nothing.
+
+    The IOKit AppleSmartBattery node is merged in as a supplement whenever it is
+    reachable: it adds `adapter_rating` (the adapter's real watts) and the charge
+    state (`is_charging`, `not_charging_reason`) without needing root or Stats.
+    It cannot give DC-in watts, so it never overrides a real watt feed - it only
+    fills gaps and labels *why* the battery is not charging.
+    """
+    feed = None
     if use_sudo:
         feed = live_power()
-        if feed:
-            return feed
-    if stats is not None:
+    if feed is None and stats is not None:
         rec = stats.reading()
         if rec:
-            return {
+            feed = {
                 'name': 'Stats',
                 'dc_in': rec.get('adapterPower'),
                 'battery': rec.get('batteryPower'),
@@ -138,4 +146,26 @@ def sensor_feed(stats: StatsSensor | None, use_sudo: bool) -> dict | None:
                 'soc': round(rec.get('level', 0) * 100),
                 'charging': rec.get('isCharging', False),
             }
-    return None
+
+    sb = smart_battery_reading()
+    if sb:
+        if feed is None:
+            # No watt source at all, but the IOKit node still tells us the
+            # adapter rating and live battery watts (V*I) - enough to steer.
+            feed = {
+                'name': 'AppleSmartBattery',
+                'dc_in': None,
+                'battery': sb['battery_watts'],
+                'adapter_rating': sb['adapter_watts'],
+                'soc': sb['soc_percent'],
+                'charging': sb['is_charging'],
+            }
+        else:
+            if feed.get('adapter_rating') is None and sb['adapter_watts']:
+                feed['adapter_rating'] = sb['adapter_watts']
+            # The IOKit charge state is fresher than the Stats cache.
+            feed['charging'] = sb['is_charging']
+        feed['not_charging_reason'] = sb.get('not_charging_reason')
+        feed['external_connected'] = sb.get('external_connected')
+
+    return feed

@@ -255,6 +255,7 @@ no battery sensor is reachable.
 |---|---|---|
 | `sudo powermetrics` | real CPU / GPU / battery watts, sub-second | root |
 | Stats app cache | DC in, battery watts, adapter rating, ~50 s cadence | Stats running |
+| IOKit `AppleSmartBattery` | charge state, live battery watts (V×I), adapter rating, why charging stopped — sub-second | nothing |
 | Battery SOC drift | true overdraw, 1% resolution, minutes | nothing |
 
 Reading the SMC directly from an ordinary process is not possible: every SMC

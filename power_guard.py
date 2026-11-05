@@ -39,6 +39,7 @@ import sys
 import time
 
 from sensor import StatsSensor, live_power, parse_power, sensor_feed
+from smartbattery import smart_battery_reading
 from tui import Dashboard, HAS_CURSES
 
 CONFIG_PATH = os.path.expanduser("~/.config/power_guard.json")
@@ -119,7 +120,19 @@ def live_power() -> dict | None:
 
 
 def power_state() -> dict:
-    """{source, soc, charging} from pmset. No root needed."""
+    """{source, soc, charging} - AppleSmartBattery (IOKit) first, pmset as a fallback.
+
+    The IOKit node gives the same charge state as pmset but sub-second and without
+    spawning a subprocess, plus it is the source WhatBattery uses, so it is the
+    most trustworthy unprivileged signal available.
+    """
+    sb = smart_battery_reading()
+    if sb:
+        return {
+            "source": "AC" if sb["external_connected"] else "Battery",
+            "soc": sb["soc_percent"],
+            "charging": sb["is_charging"],
+        }
     out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True).stdout
     src = "AC" if "AC Power" in out else "Battery"
     soc = charging = None
@@ -374,14 +387,17 @@ class Guard:
         if batt is not None and batt < BATTERY_MARGIN:
             self.budget_cores = max(2.0, min(self.budget_cores, ceiling_cores)
                                     - (-batt) / self.w_per_core)
-            return (f"{feed['name']}: battery giving {-batt:.1f} W, adapter "
-                    f"{dc:.0f} W of {ceiling:.0f} W -> budget {self.budget_cores:.1f} cores")
+            dc_txt = f"{dc:.0f} W" if dc is not None else "adapter n/a"
+            return (f"{feed['name']}: battery giving {-batt:.1f} W, {dc_txt} of "
+                    f"{ceiling:.0f} W -> budget {self.budget_cores:.1f} cores")
         if dc is not None and dc >= 0.92 * ceiling:
             self.budget_cores = min(self.budget_cores, ceiling_cores)
             return (f"{feed['name']}: adapter pegged at {dc:.0f} W of {ceiling:.0f} W, "
                     f"budget held at {self.budget_cores:.1f} cores")
         self.budget_cores = min(ceiling_cores, self.budget_cores + 1.0)
-        return (f"{feed['name']}: {dc:.0f} W in, battery {batt:+.1f} W, ceiling "
+        dc_txt = f"{dc:.0f} W in" if dc is not None else "no DC-in reading"
+        batt_txt = f"{batt:+.1f} W" if batt is not None else "battery n/a"
+        return (f"{feed['name']}: {dc_txt}, battery {batt_txt}, ceiling "
                 f"{ceiling:.0f} W = {ceiling_cores:.1f} cores ({self.w_per_core:.1f} W/core)")
 
     def steer(self, now: float, soc: int | None, cores: float) -> str:
