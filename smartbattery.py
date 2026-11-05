@@ -7,6 +7,14 @@ its keys one at a time. What it cannot do is open `AppleSMC`, which is why
 WhatBattery ships a signed entitlement for the live SMC rails (PPBR/PDTR) and
 we cannot copy that here.
 
+Refresh cadence, measured on an M4 Pro: `IsCharging`, `FullyCharged`,
+`ExternalConnected` and the adapter rating are reliable and effectively instant.
+`InstantAmperage`/`Voltage` step only every ~30-90 s (the gauge holds a value
+between updates), so treat battery watts as a slow signal like SOC drift, not a
+sub-second feedback loop. Its *sign* is still a true overdraw measurement: a
+negative amperage while plugged in means the cell is feeding the gap the adapter
+cannot cover.
+
 This module deliberately mirrors only what power-guard needs:
 
   * `ExternalConnected`   - is the adapter attached at all
@@ -160,6 +168,10 @@ class _SmartBattery:
             "voltage_mv": volts,
             "amperage_ma": amps,
             "battery_watts": watts,          # + = charging, - = discharging, 0 = parked
+            # A negative amperage while plugged in is a direct measurement that
+            # the adapter cannot cover the load and the cell is supplying the gap.
+            "discharging_while_plugged": bool(amps is not None and amps < 0
+                                             and self._number(entry, "ExternalConnected")),
             "adapter_watts": self._dict_number(entry, "AdapterDetails", "Watts"),
             "not_charging_reason": self._dict_number(entry, "ChargerData", "NotChargingReason"),
         }

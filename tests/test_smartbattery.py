@@ -43,3 +43,7 @@ def test_real_node_returns_coherent_state():
         assert -200 < r["battery_watts"] < 200
     if r["adapter_watts"] is not None:
         assert 0 < r["adapter_watts"] <= 200
+    assert isinstance(r["discharging_while_plugged"], bool)
+    # The flag must be consistent with the amperage sign.
+    if r["amperage_ma"] is not None and r["external_connected"]:
+        assert r["discharging_while_plugged"] == (r["amperage_ma"] < 0)
