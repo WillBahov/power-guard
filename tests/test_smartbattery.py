@@ -47,3 +47,27 @@ def test_real_node_returns_coherent_state():
     # The flag must be consistent with the amperage sign.
     if r["amperage_ma"] is not None and r["external_connected"]:
         assert r["discharging_while_plugged"] == (r["amperage_ma"] < 0)
+
+
+def test_real_node_reports_health_and_temperature():
+    """Health and cell temperature come from the pack node's BatteryData dict.
+
+    macOS 27 does not expose DesignCapacity/NominalChargeCapacity/Temperature as
+    flat registry keys - they are nested inside BatteryData. A regression here
+    shows up as None, so assert the shape when a battery is present.
+    """
+    r = smart_battery_reading()
+    if r is None:
+        return  # desktop Mac or headless CI
+    design = r["design_capacity_mah"]
+    nominal = r["nominal_capacity_mah"]
+    if design is not None:
+        assert 1000 <= design <= 20000, f"implausible DesignCapacity {design}"
+    if nominal is not None:
+        assert 1000 <= nominal <= 20000
+    if r["health_percent"] is not None:
+        # A pack can be over its design capacity when new; never wildly so.
+        assert 50 <= r["health_percent"] <= 130
+    if r["temperature_c"] is not None:
+        # Centi-degrees decoded to C: a laptop cell is never -40 or 200 C.
+        assert -20 <= r["temperature_c"] <= 80

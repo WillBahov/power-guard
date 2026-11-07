@@ -15,9 +15,12 @@ core that ceiling is 8 cores: `(75 - 15) / 7.5`. The core budget is derived from
 the watt cap, so `--charger-watts` / `--budget-watts` decide when the throttle
 engages.
 
-* **Stdlib only** — `ps`, `pmset`, `sysctl`, `os.kill`. No pip install, no root.
+* **Stdlib only** — `ps`, `pmset`, `sysctl`, `ctypes`, `os.kill`. No pip install, no root.
+* **Live watts without root** — the AppleSMC user client (`smc.py`) reads DC-in, total system load and battery watts from an ordinary process, so the guard no longer needs the Stats app or `sudo powermetrics`.
 * **Python 3.9+**, macOS only (the battery read uses `pmset`).
-* Never touches system processes (`WindowServer`, `powerd`, `launchd`, …).
+* Never touches system processes: essential daemons (`WindowServer`, `powerd`,
+  `launchd`, …), accessibility agents, and any root-owned process are skipped by
+  a safety policy modelled on OpenTamer's.
 * Goes idle the moment you unplug, and releases every stopped process on exit.
 
 ---
@@ -64,24 +67,42 @@ limits.
 
 ## The dashboard
 
-`guard` runs a live dashboard whenever stdout is a terminal (the status line
-turns red when the estimate crosses the ceiling) (use `--no-ui` for
-the plain one-line-per-tick log, which is what the LaunchAgent uses). It shows:
+`guard` runs a live dashboard whenever stdout is a terminal (use `--no-ui` for
+the plain one-line-per-tick log, which is what the LaunchAgent uses). Each
+information type sits in its own box — header, battery drain, power, load and
+top processes — so nothing runs into the next, and colour separates them:
+the drain box is red (green while charging), POWER/LOAD cyan, TOP PROCESSES
+magenta, the header blue. The battery draw is the headline: a full-width box
+with a sparkline of the last 24 ticks, and each process's proportional slice
+of that drain in its own row:
 
 ```
- POWER GUARD  ·  14 cores  ·  15:20:46  ·  AC
- adapter 75 W   ceiling 60 W   budget 6.0 cores   mode auto   tick 1.0s   under the 60 W ceiling, 12 W headroom
- load  ████░░░░░░░░░░░░░░░░│░░░░░░░░░░░░░░░░░░░░░░░░
-       1.29 cores busy  est ~25 W   soc 77%  False
- trend  ▄▅▁▇▂▃▂   last 6 ticks
- throttle: 3 processes held back   lost -1% in 3 min (14 W over the adapter) -> budget 5.0 cores
-   pid    process                  demand   duty
-   22580  node                     1.29   100%
-   437964 com.apple.WebKit.WebCo   0.61    60%
+┌─ POWER GUARD  15:20:46  AC ────────────┐
+│ mode auto · holding back 3 process(es) │
+└────────────────────────────────────────┘
+┌─ BATTERY DRAIN ────────────────────────┐
+│ ▁▂▅█▄█  12.4 W draining                │
+│ soc 77% · health 100%                  │
+│ cell 31.7 C · usable 74.2 Wh           │
+└────────────────────────────────────────┘
+┌─ POWER ───────────┐ ┌─ LOAD ────────────┐
+│ adapter 94 W rated│ │ CPU 1.29 of 14    │
+│ DC in   71.2 W    │ │ ██░░░░░│░░░░░░░░░ │
+│ ceiling 60 W(6.0c)│ │ est draw 30 W     │
+│ OVER by 11 W      │ └───────────────────┘
+└───────────────────┘
+┌─ TOP PROCESSES ──────────────────────────────────┐
+│ node             9.7 W ██████████ full  7.0W bat │
+│ com.apple.WebK   4.6 W █████▒▒▒▒▒ 60%  3.3W bat  │
+│ python3          3.0 W ███▒▒▒▒▒▒▒ full  2.2W bat │
+└──────────────────────────────────────────────────┘
+ lost -1% in 3 min (14 W over the adapter) -> budget 5.0 cores
+ TREND ▄▅▁▇▂▃▂   last 6 ticks
 ```
 
-The `│` in the load bar is the budget; the sparkline is the last 40 ticks. Keys
-are read without blocking the control loop:
+`health`, `cell` and `usable` come from the IOKit battery node — no root, no
+Stats, no third-party app. The `│` in the load bar is the budget; the drain
+sparkline is the last 24 ticks. Keys are read without blocking the control loop:
 
 | Key | Effect |
 |---|---|
@@ -91,11 +112,12 @@ are read without blocking the control loop:
 | `q` | Quit — releases every stopped process |
 
 The dashboard is stdlib `curses`, and the rendering helpers (`gauge`, `spark`,
-`fmt_rows`, `head`) are pure functions covered by `tests/test_tui.py`.
+`watt_bar`, `head`) are pure functions covered by `tests/test_tui.py`; boxes
+fall back to ASCII if the terminal can't encode box-drawing characters.
 
 ---
 
-## The four commands
+## The seven commands
 
 ### `status` — what is drawing power now
 
@@ -171,6 +193,51 @@ Only that command and its descendants are throttled. The guard exits when the
 child does. Useful for a heavy EnergyPlus run that you know is hammering all 14
 cores while you keep working in other apps.
 
+### `power` — which telemetry this Mac will actually give you
+
+```bash
+python3 power_guard.py power
+```
+
+Lists every source the tool can reach and what it returned: `sudo powermetrics` if
+sudo is passwordless, the AppleSMC user client, the Stats app cache, the IOKit
+battery node. Purely diagnostic — it stops nothing. Run it once to find out why
+`--auto` is or is not seeing real watts.
+
+### `charge` — why the battery is parked, and what a tool could control
+
+```bash
+python3 power_guard.py charge
+python3 power_guard.py charge --hold      # attempt an SMC charge-disable (root)
+```
+
+macOS 26.4+ has a native Charge Limit, readable without root through
+`pmset -g battlimit`. On this machine it is set to 80% and the battery is
+genuinely parked, not draining. `charge` decodes `NotChargingReason` into plain
+language and reports which SMC charge keys exist, so you know whether a
+"hold the charge" actuator is even possible here.
+
+Worth being blunt about: stopping *charging* is not the same as stopping
+*discharge*. When demand exceeds what the adapter can deliver, the cell still
+feeds the gap, and only a load cap prevents that.
+
+### `gate` — run a heavy build without blowing the budget
+
+```bash
+python3 power_guard.py gate --slots 1 --workers 4 -- cargo build
+```
+
+Queues heavy jobs (one at a time by default) and rewrites the toolchain's own
+parallelism flag instead of pausing processes: `cargo --jobs`, `make -j`,
+`ninja -j`, `gradle --max-workers`, `cmake --build -j`. For anything else it
+exports `POWER_GUARD_MAX_WORKERS` and leaves the command alone. The queue lives
+in `~/.cache/power_guard/gate` as one JSON file per running job, created with
+`O_EXCL` so two processes cannot take the same slot; stale entries are swept, so
+a crashed job cannot deadlock the queue.
+
+`status` also groups the running heavy toolchains by project, so you can see
+which build is the one eating the adapter before deciding what to cap.
+
 ### `calibrate` — measure the knee on *your* machine
 
 ```bash
@@ -191,7 +258,7 @@ headroom instead.
 |---|---|---|---|
 | `--ui` / `--no-ui` | `guard` | dashboard on in a terminal, off otherwise | Live dashboard vs plain log |
 | `--charger-watts W` | all | `75` | The watt ceiling the guard acts at |
-| `--sensor` | `guard`, `power` | `auto` | `stats`, `sudo`, `soc` or auto-detect |
+| `--sensor` | `guard`, `power` | `auto` | `sudo`, `smc`, `stats`, `soc`, or auto-detect |
 | `--budget-watts W` | `guard` | same as `--charger-watts` | Engage when the estimated draw hits W |
 | `--budget-cores N` | `guard`, `status` | derived from the watt cap | Pin the budget in cores |
 | `--idle-watts W` | all | `15` | Base draw of an otherwise idle machine |
@@ -206,6 +273,12 @@ headroom instead.
 | `--debug` | `guard` | off | Print each process's demand and duty every tick |
 | `--quiet` | `guard` | off | Suppress the per-tick line |
 | `--cores N` | `wrap` | `8` | Cap for the wrapped command |
+| `--low-power` | `guard` | `off` | `off` / `auto` / `on` — Low Power Mode as the second throttle |
+| `--slots N` | `gate` | `1` | Heavy jobs allowed at the same time |
+| `--workers N` | `gate` | `4` | Worker cap the toolchain is told to use |
+| `--poll S` | `gate` | `5` | Seconds between queue checks |
+| `--always` | `gate` | off | Queue jobs even when the adapter has headroom |
+| `--hold` | `charge` | off | Try the SMC charge-disable key (needs root, and the key must exist) |
 
 `--w-per-core` and `--battery-wh` only matter for the *displayed* watt estimate
 and for `calibrate`'s knee calculation. `--auto` steers on real SOC drift, so it
@@ -254,36 +327,113 @@ no battery sensor is reachable.
 | Source | What it gives | Needs |
 |---|---|---|
 | `sudo powermetrics` | real CPU / GPU / battery watts, sub-second | root |
-| Stats app cache | DC in, battery watts, adapter rating, ~50 s cadence | Stats running |
+| AppleSMC user client (`smc.py`) | DC in, total system load, battery watts, cell temperature, adapter physically present — sub-second | nothing |
+| `proc_pid_rusage` (`energy.py`) | measured watts, cores and ANE footprint per process | nothing |
+| Stats app cache | DC in, battery watts, adapter rating, ~50 s cadence (fallback) | Stats running |
 | IOKit `AppleSmartBattery` | charge state, live battery watts (V×I), adapter rating, why charging stopped — sub-second | nothing |
+| IOKit `AppleSmartBatteryPack` | battery health (`DesignCapacity` / `NominalChargeCapacity`) and cell temperature — sub-second | nothing |
 | Battery SOC drift | true overdraw, 1% resolution, minutes | nothing |
 
-Reading the SMC directly from an ordinary process is not possible: every SMC
-user client under `IODeviceTree:/arm-io/smc`, including `smc-charger-util`,
-refuses `IOServiceOpen`, `ioreg` exposes no power properties, `top`'s POWER
-column is not watts, and `sysctl` has nothing. Stats can read those sensors
-because it ships with the entitlement.
+Health and temperature are **not** flat registry keys on macOS 27. They live
+inside the `BatteryData` dictionary on the pack node, so reading them needs a
+nested lookup (`smartbattery._battery_data_number`). Getting this wrong returns
+`None` silently rather than raising, which is why `tests/test_smartbattery.py`
+asserts the shape of those fields on a real laptop.
+
+Health matters for the control loop: `--auto` converts a SOC percentage drop
+into watts using the pack's capacity. A worn battery holds less than the nominal
+71 Wh, so assuming new capacity underestimates the drain and the throttle
+under-corrects. `Guard.battery_wh` is measured at startup from the node; pass
+`--battery-wh` only if you want to override it.
+
+**The SMC is readable without root.** Earlier versions of this README said the
+opposite: `IOServiceOpen` on `AppleSMC` with user-client type 0 succeeds from an
+ordinary process on macOS 27.2, and `PDTR` (DC in), `PSTR` (system load), `SBAP`
+(battery watts), `SBAV`/`ID0R` (volts/amps) and `TB0T`-`TB2T` (cell temperature)
+all answer. Writing does not — a write returns `kIOReturnNotPrivileged`
+(`0xe00002c1`), which is why ChargeWatch and Battery-Toolkit install a root
+LaunchDaemon instead of touching the keys in-process. `PowerTelemetryData` in the
+IORegistry is *frozen*: identical values across samples seconds apart, so the
+SMC is the fresher source.
+
+`smc.py` stands alone if you want to see it — `python3 smc.py` prints ten live
+samples, `python3 smc.py probe` dumps the charge-control key table.
 
 To make the guard independent of Stats, run it with sudo once:
 
 ```bash
-sudo ./power_guard.py guard --sensor sudo      # live watts from powermetrics
+./power_guard.py guard --auto                 # SMC watts, no root at all
 ```
 
-or give the tool a passwordless sudoers entry and stay unprivileged:
+`sudo powermetrics` is now only a fallback for the GPU/ANE detail the SMC does not
+expose. To use Low Power Mode as a second throttle, install a scoped sudoers rule
+instead of blanket sudo:
 
-```
-will ALL=(ALL) NOPASSWD: /usr/bin/powermetrics
+```bash
+sudo bash scripts/lowpower-no-password.sh     # allows ONLY pmset -a lowpowermode 0|1
+undo: sudo rm /etc/sudoers.d/power-guard
 ```
 
 ---
 
+---
+
+## Root is optional — here is what it buys you
+
+Nothing in the guard needs root: the SMC power keys, the battery node, the
+per-process energy counters and the charge limit are all readable from an
+ordinary process. Root unlocks exactly two things:
+
+1. **`sudo powermetrics`** — the GPU and Neural Engine breakdown the SMC does not
+   expose. Either run the guard under sudo (the ticket is cached, so the tool's
+   inner `sudo -n` calls succeed):
+
+   ```bash
+   sudo ./power_guard.py guard --auto --sensor sudo
+   ```
+
+2. **Low Power Mode** — the only throttle that reaches the display and GPU.
+   Instead of blanket sudo, install a scoped rule that allows two exact
+   commands and nothing else:
+
+   ```bash
+   sudo bash scripts/lowpower-no-password.sh     # pmset -a lowpowermode 0|1 only
+   undo: sudo rm /etc/sudoers.d/power-guard
+   ```
+
+   Then `guard --low-power auto` turns Low Power Mode on only when the CPU budget
+   has hit its floor and the battery is still draining, and turns it back off as
+   soon as the drain stops.
+
+Root does **not** unlock a "run on the adapter only" switch. The SMC key that
+would do it (`CHTE`, charge-disable) does not exist on this Mac, and the only
+charge key present (`CHIE`) cloaks the adapter — writing it makes the battery
+discharge. That is a hardware/firmware limit, not a permissions limit.
+
+---
+
+## Prior art
+
+Six related projects were read end to end. What shipped here is the mechanism
+that survived contact with this machine:
+
+| Repo | What was taken | What was not |
+|---|---|---|
+| ChargeWatching (MIT) | `pmset -g battlimit` reading; fail-safe discipline (restore on exit, Apple's 5% hysteresis, treat adapter presence as ground truth, not `ExternalConnected`) | the SMC-write LaunchDaemon — the key it needs is absent here |
+| Fluxa-Mac (MIT) | the unprivileged SMC key set (`PDTR`, `PSTR`, `SBAV`, `ID0R`), backlight watts | its IOReport path, which is hardcoded to a CLPC model this Mac does not have |
+| Battery Hog (MIT) | the scoped sudoers trick for Low Power Mode; the `gate` idea of capping toolchain workers instead of pausing processes | sleep-assertion blockers, not relevant here |
+| ChargeMonitor (MIT) | responsible-PID grouping, which fixes PID churn in the load sampler | its disk/wakeup scoring, which the guard does not need |
+| BetterBattery (MIT) | fan RPM and lifetime charge/discharge Wh as battery-health context | nothing else — it is a monitor, not a controller |
+| powerlens (AGPL-3.0) | ideas only: the `holdingAtLimit` framing and its diagnostics engine | code, because AGPL is viral and this tool is stdlib-MIT |
+
 ## Known limits
 
-* **CPU only.** GPU and the Neural Engine cannot be measured without root
-  (`powermetrics` is root-only), and `SIGSTOP` on a GPU-bound process does not
-  stop its GPU work. If your drain is GPU/ANE, cap it with that app's own thread
-  or device settings, and use the CPU budget only to leave headroom.
+* **CPU-only throttle.** `SIGSTOP` on a GPU-bound process does not stop its GPU
+  work, and the SMC reports *system* watts rather than a GPU/ANE breakdown.
+  `energy.py` does give per-process ANE footprint, and the difference between SMC
+  `PSTR` and the sum of process watts is the part the CPU budget cannot touch.
+  Low Power Mode (`--low-power auto`) is the only switch that reaches GPU, display
+  and background work — which is why it is the second throttle.
 * **Stopping is abrupt.** Duty-cycling stops processes for part of each tick.
   Apps with hard real-time deadlines (audio capture, video calls, latency
   sensitive simulations) can hiccup. Raise `--floor`, use `--exclude`, or use
@@ -299,9 +449,11 @@ will ALL=(ALL) NOPASSWD: /usr/bin/powermetrics
 * **On battery the guard does nothing** — there is nothing to protect, and
   throttling would shorten your runtime for no reason. It releases all stopped
   processes and idles until you plug back in.
-* **PID churn.** Processes that repeatedly fork new workers (some Python
-  multiprocessing pools) can slip past the budget, since a freshly restarted
-  worker starts with full duty. Prefer `wrap` for those.
+* **PID churn, mostly fixed.** `responsibility_get_pid_responsible_for_pid`
+  folds helper processes into the app that spawned them — the same call Activity
+  Monitor uses — so a pool of short-lived workers counts as one process. A worker
+  restarted mid-tick still starts at full duty, so `wrap` or `gate` remains the
+  better choice for a job you can plan in advance.
 
 ---
 
@@ -310,6 +462,12 @@ will ALL=(ALL) NOPASSWD: /usr/bin/powermetrics
 | Path | What it is |
 |---|---|
 | `power_guard.py` | The tool — stdlib only, executable |
+| `smc.py` | AppleSMC user client: live DC-in/system/battery watts, no root; charge-key probe |
+| `energy.py` | Measured per-process watts via `proc_pid_rusage`, grouped by responsible app |
+| `chargepolicy.py` | Native charge limit from `pmset -g battlimit`, `NotChargingReason` decode |
+| `lowpower.py` | Low Power Mode read/toggle with the scoped-sudoers fail-safe |
+| `workloads.py` | Toolchain detection, worker capping, heavy-job queue |
+| `scripts/lowpower-no-password.sh` | Installs the narrow sudoers rule for Low Power Mode |
 | `tui.py` | The curses dashboard (render helpers are pure and tested) |
 | `Power Guard.command` | Double-click to start the guard in Terminal |
 | `power-guard` | Same thing, for a name on `PATH` |
@@ -323,7 +481,8 @@ will ALL=(ALL) NOPASSWD: /usr/bin/powermetrics
 ## Tests
 
 ```bash
-python3 -m pytest tests/ -q        # 17 tests: scheduler, watts math, dashboard rendering
+python3 -m pytest tests/ -q        # 88 tests: scheduler, watts math, SMC decoding,
+                                     # charge policy, workloads, dashboard rendering
 ```
 
 No machine state is required — the suite runs the scheduler against a simulated
@@ -333,6 +492,18 @@ load, so it verifies the controller converges rather than ringing.
 
 ## Verified on this machine
 
+* **SMC reads work unprivileged.** `PDTR` 50–83 W DC in, `PSTR` 36–69 W system
+  load, `SBAP` ≈ 0 W with the battery parked at 80%. `PDTR ≈ PSTR + |SBAP|` held
+  in every sample.
+* **`CHTE` does not exist on this Mac.** Only `CHIE` (adapter cloak) is present,
+  and writing it disconnects the adapter and makes the battery *discharge* — the
+  opposite of the goal — so `charge --hold` refuses to act on a machine with no
+  charge-disable key. Writes from an ordinary process are refused outright.
+* **Per-process watts are real.** One busy Python loop measured 5.7 W through
+  `ri_energy_nj`; the `7.5 W/core` constant is now a calibration starting point
+  rather than the source of truth.
+* **The adapter's real ceiling is below its nameplate.** Under a 14-core CPU burn
+  the 100 W brick stopped rising near 83 W while the cell supplied the difference.
 * 12 busy loops under the default 75 W ceiling: load fell from ~14.6 cores to
   2–3 cores and stayed inside the budget. A 3-core budget with 4 loops settled
   at 1.7–2.9 cores after an initial transient.

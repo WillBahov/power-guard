@@ -17,7 +17,7 @@ def test_stats_sensor_reads_the_latest_record(tmp_path):
     d.mkdir()
     (d / "000001.log").write_bytes(b"binary junk\x00" + RECORD + b"\x00trailing")
     sensor = StatsSensor(str(d))
-    feed = sensor_feed(sensor, False)
+    feed = sensor_feed(sensor, False, use_smc=False)
     assert feed["name"] == "Stats"
     assert feed["dc_in"] == 62.4            # "DC in" - watts from the adapter
     assert feed["battery"] == -11.2        # negative = the battery is feeding the gap

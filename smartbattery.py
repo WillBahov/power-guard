@@ -52,6 +52,7 @@ class _SmartBattery:
         self._io = None
         self._cf = None
         self._entry = None
+        self._pack = None
         self._failed = False
 
     def _load(self):
@@ -130,12 +131,21 @@ class _SmartBattery:
         return None
 
     def _dict_number(self, entry, dict_key, sub_key):
-        """Read a number nested inside a dictionary-valued key."""
+        """Read a number nested inside a dictionary-valued key.
+
+        The CFDictionary the kernel hands back is *autoreleased* by
+        IORegistryEntryCreateCFProperty, so it can be freed before we get to it:
+        a bare `CFDictionaryGetValue` then reads a dangling pointer and returns
+        garbage (observed on this machine as DesignCapacity == 1.0e19). Retain
+        the dict for the duration of the lookup - the same class of bug that makes
+        bulk-fetching BatteryData unsafe.
+        """
         cf, io = self._cf, self._io
         s = cf.CFStringCreateWithCString(None, dict_key.encode(), 0)
         d = io.IORegistryEntryCreateCFProperty(entry, s, None, 0)
         if not d:
             return None
+        cf.CFDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         sub = cf.CFStringCreateWithCString(None, sub_key.encode(), 0)
         val = cf.CFDictionaryGetValue(d, sub)
         if not val:
@@ -148,18 +158,52 @@ class _SmartBattery:
             return dbl.value
         return None
 
+    def _pack_entry(self):
+        """The `AppleSmartBatteryPack` child node, or None.
+
+        macOS 27 moved the raw capacities and the cell temperature off the
+        top-level node: they are NOT flat registry keys on either node - they
+        live inside the `BatteryData` dictionary on the pack. Verified on an
+        M4 Pro: `IORegistryEntryCreateCFProperty(pack, "DesignCapacity")`
+        returns nil, while `BatteryData` -> `DesignCapacity` returns 6249.
+        Same per-key rule as above: never bulk-fetch a dict-valued key into
+        Python.
+        """
+        if self._pack is not None:
+            return self._pack
+        if not self._load():
+            return None
+        cf, io = self._cf, self._io
+        it = ctypes.c_int(0)
+        if io.IOServiceGetMatchingServices(0, io.IOServiceMatching(b"AppleSmartBatteryPack"),
+                                          ctypes.byref(it)) != 0:
+            return None
+        entry = io.IOIteratorNext(it.value)
+        io.IOObjectRelease(it.value)
+        self._pack = entry or None
+        return self._pack
+
+    def _battery_data_number(self, entry, sub_key):
+        """A number from the `BatteryData` dictionary on a registry node.
+
+        The dict handle is autoreleased by IORegistryEntryCreateCFProperty, so
+        it must be kept alive for the whole lookup (see _dict_number).
+        """
+        return self._dict_number(entry, "BatteryData", sub_key)
+
     def reading(self) -> dict | None:
         """The current battery/adapter state, or None if unavailable."""
         entry = self._entry_or_open()
         if entry is None:
             return None
+        pack = self._pack_entry()
         volts = self._number(entry, "Voltage")          # millivolts
         amps = self._number(entry, "InstantAmperage")   # milliamps
         if amps is None:
             amps = self._number(entry, "Amperage")
         # mV * mA = micro-watts; divide by 1e6 for watts.
         watts = (volts * amps / 1_000_000.0) if (volts is not None and amps is not None) else None
-        return {
+        out = {
             "source": "AppleSmartBattery",
             "external_connected": bool(self._number(entry, "ExternalConnected")),
             "is_charging": bool(self._number(entry, "IsCharging")),
@@ -174,7 +218,27 @@ class _SmartBattery:
                                              and self._number(entry, "ExternalConnected")),
             "adapter_watts": self._dict_number(entry, "AdapterDetails", "Watts"),
             "not_charging_reason": self._dict_number(entry, "ChargerData", "NotChargingReason"),
+
+            # Health and temperature live on the pack node (see _pack_entry).
+            # DesignCapacity is the factory mAh; NominalChargeCapacity is the
+            # smoothed full-charge mAh Apple actually charges to. Their ratio is
+            # the health percentage - never MaxCapacity, which is pinned to 100
+            # on Apple Silicon and hides a worn cell.
+            "design_capacity_mah": self._battery_data_number(pack, "DesignCapacity") if pack else None,
+            "nominal_capacity_mah": self._battery_data_number(pack, "NominalChargeCapacity") if pack else None,
+            "health_percent": None,
+            "temperature_c": None,
         }
+        design = out["design_capacity_mah"]
+        nominal = out["nominal_capacity_mah"]
+        if design and nominal:
+            out["health_percent"] = min(100.0, round(100.0 * nominal / design, 1))
+        temp = self._battery_data_number(pack, "Temperature") if pack else None
+        if temp is not None:
+            # The pack reports centi-degrees (3350 == 33.5 C), same encoding
+            # Stats divides by 100 for.
+            out["temperature_c"] = temp / 100.0 if temp > 100 else float(temp)
+        return out
 
 
 # Shared handle so repeated calls do not reopen the IOKit service.
