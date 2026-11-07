@@ -2,7 +2,7 @@
 
 `power_guard.py` keeps a plugged-in MacBook Pro off its battery by capping
 **aggregate CPU load**. The adapter is rated 100 W but only sustains about
-**75 W** under real load, and a fully loaded M4 Pro plus the GPU and display
+**83 W** under real load - the SMC reports the adapter pegged there, well below its 100 W nameplate - and a fully loaded M4 Pro plus the GPU and display
 wants more, so macOS quietly borrows the difference from the battery. There is no `pmset` setting, no System Settings toggle and no API for
 "run on the adapter only" — the only lever software has is the load itself.
 
@@ -10,8 +10,9 @@ The tool measures per-process CPU demand from `ps` CPU-time deltas (in
 core-equivalents, the unit power actually scales in) and duty-cycles the busy
 processes with `SIGSTOP`/`SIGCONT` so total CPU converges on a budget.
 
-The guard acts at **75 W by default**. With a 15 W base draw and 7.5 W per loaded
-core that ceiling is 8 cores: `(75 - 15) / 7.5`. The core budget is derived from
+The guard acts at **85 W by default** - the measured knee where the battery starts
+contributing. With a 20 W base draw and 7.5 W per loaded core that ceiling is 8.7
+cores: `(85 - 20) / 7.5`. The core budget is derived from
 the watt cap, so `--charger-watts` / `--budget-watts` decide when the throttle
 engages.
 
@@ -47,7 +48,7 @@ cd /Users/will/Documents/Projects/power-guard
 # 1. see what is drawing power right now
 ./power_guard.py status
 
-# 2. run the guard - the budget is derived from the 75 W cap and steered
+# 2. run the guard - the budget is derived from the 85 W cap and steered
 #    off the actual battery trend
 ./power_guard.py guard --auto
 ```
@@ -257,18 +258,18 @@ headroom instead.
 | Flag | Applies to | Default | Meaning |
 |---|---|---|---|
 | `--ui` / `--no-ui` | `guard` | dashboard on in a terminal, off otherwise | Live dashboard vs plain log |
-| `--charger-watts W` | all | `75` | The watt ceiling the guard acts at |
+| `--charger-watts W` | all | adapter rating, else `85` | The watt ceiling the guard acts at |
 | `--sensor` | `guard`, `power` | `auto` | `sudo`, `smc`, `stats`, `soc`, or auto-detect |
 | `--budget-watts W` | `guard` | same as `--charger-watts` | Engage when the estimated draw hits W |
 | `--budget-cores N` | `guard`, `status` | derived from the watt cap | Pin the budget in cores |
-| `--idle-watts W` | all | `15` | Base draw of an otherwise idle machine |
+| `--idle-watts W` | all | `20` | Base draw of an otherwise idle machine |
 | `--w-per-core W` | all | `7.5` | Watts per busy core (calibration constant) |
 | `--auto` | `guard` | off | Steer the budget off measured battery drain |
 | `--fb-window S` | `guard` | `180` | Seconds of SOC history before a correction is made |
 | `--tick S` | `guard`, `wrap` | `1.0` | Sampling/stop-continue period in seconds |
 | `--floor N` | `guard` | `0.2` | Processes below this demand are never stopped |
 | `--exclude NAME` | `guard` | — | Never stop this process (repeatable) |
-| `--battery-wh Wh` | `guard`, `calibrate` | `71` | Battery capacity, for converting SOC drift to watts |
+| `--battery-wh Wh` | `guard`, `calibrate` | measured from the battery node (`73.9` here) | Battery capacity, for converting SOC drift to watts |
 | `--duration S` | `guard` | run forever | Exit after N seconds |
 | `--debug` | `guard` | off | Print each process's demand and duty every tick |
 | `--quiet` | `guard` | off | Suppress the per-tick line |
@@ -288,8 +289,8 @@ does not depend on the constant being right.
 
 ## How to pick a budget
 
-The default budget is whatever the cap implies: 75 W minus a 15 W base draw, over
-7.5 W per core = 8 cores on a 14-core M4 Pro. If the GPU or display is what is
+The default budget is whatever the cap implies: 85 W minus a 20 W base draw, over
+7.5 W per core = 8.7 cores on a 14-core M4 Pro. If the GPU or display is what is
 really draining the battery, drop the ceiling (`--budget-watts 60`) or let
 `--auto` find it. Then:
 
@@ -314,7 +315,7 @@ MacBook Pro. The sensors on this machine say otherwise:
   adapter cannot - observed as 84 W DC in plus 30 W from the battery for a
   114 W total during a heavy render.
 
-So the guard's real rule is not "stay under 75 W". It is:
+So the guard's real rule is not "stay under 85 W". It is:
 
 > **Never let the battery discharge while the adapter is attached.**
 
@@ -504,7 +505,7 @@ load, so it verifies the controller converges rather than ringing.
   rather than the source of truth.
 * **The adapter's real ceiling is below its nameplate.** Under a 14-core CPU burn
   the 100 W brick stopped rising near 83 W while the cell supplied the difference.
-* 12 busy loops under the default 75 W ceiling: load fell from ~14.6 cores to
+* 12 busy loops under the default 85 W ceiling: load fell from ~14.6 cores to
   2–3 cores and stayed inside the budget. A 3-core budget with 4 loops settled
   at 1.7–2.9 cores after an initial transient.
 * `wrap --cores 3` on an 8-process multiprocessing job: held at 2.99–3.40 cores,
