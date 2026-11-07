@@ -24,7 +24,8 @@ Measured on this machine (M4 Pro, 14 cores, 71 Wh battery, 2026-11-03):
 | 14 busy loops + normal background apps | ~15 cores | 78% -> 77% in 8 min |
 
 1% of 71 Wh over 8 minutes is **8.5 W**. So the CPU alone at full load sits
-just under the adapter's nominal 100 W, but above the ~75 W it can
+just under the adapter's nominal 100 W, but above the ~83 W the SMC
+reports as its DC-in plateau
 hold continuously; it is the CPU *plus* display, GPU/ANE and the usual
 background daemons that cross the line. That has two consequences:
 
@@ -72,7 +73,7 @@ SIGCONTs every process it stopped on exit or Ctrl-C. Stdlib only: `ps`, `pmset`,
 python3 power_guard.py status
 
 # hard cap the machine at 8 cores
-python3 power_guard.py guard --auto              # budget derived from the 75 W cap
+python3 power_guard.py guard --auto              # budget derived from the 85 W cap
 
 # self-calibrating, running in the background
 nohup python3 power_guard.py guard --auto --budget-cores 12 \
